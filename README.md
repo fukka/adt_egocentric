@@ -1,9 +1,10 @@
 # apt_egocentric
 
-Render photorealistic egocentric fisheye images from [Aria Digital Twin (ADT)](https://www.projectaria.com/datasets/adt/) ground-truth poses using Blender 3.6 and the Aria FISHEYE624 camera model.
+Render photorealistic egocentric fisheye images from [Aria Digital Twin (ADT)](https://www.projectaria.com/datasets/adt/) ground-truth poses using Blender 3.6 and the Aria FISHEYE624 camera model. Also includes a SAM 2.1 Large segmentation evaluation pipeline against ADT ground-truth instance segmentation.
 
 ```
 ADT ground-truth poses → Blender (Cycles) → equirectangular → FISHEYE624 remap → fisheye PNG
+ADT real RGB frame     → SAM 2.1 Large    → instance masks  → IoU vs GT segmentation
 ```
 
 ---
@@ -17,20 +18,23 @@ ADT ground-truth poses → Blender (Cycles) → equirectangular → FISHEYE624 r
 - Applies the **GLTF Y-up → ADT Z-up rotation fix** (`R_correct = R_adt @ R_x(−90°)`) so all objects render upright
 - Distance-culls to the nearest 80 objects to stay within memory limits
 - Caches the fisheye remap LUT (`.npz`) — computed once per output resolution, reused on subsequent runs
+- Evaluates **SAM 2.1 Large** zero-shot instance segmentation on real egocentric frames against ADT GT, reporting per-instance IoU
 
 ---
 
 ## Requirements
 
-| Dependency | Version |
-|---|---|
-| Python | 3.10+ |
-| Blender | 3.6.x |
-| projectaria-tools | 2.1.1 |
-| numpy | any recent |
-| scipy | any recent |
-| Pillow | any recent |
-| opencv-python | any recent |
+| Dependency | Version | Used for |
+|---|---|---|
+| Python | 3.10+ | all scripts |
+| Blender | 3.6.x | rendering |
+| projectaria-tools | 2.1.1 | ADT data loading |
+| numpy | any recent | all scripts |
+| scipy | any recent | fisheye remap |
+| Pillow | any recent | image I/O |
+| opencv-python | any recent | image processing |
+| sam2 | 2.1 (SAM 2.1) | segmentation |
+| torch | 2.x | SAM 2 backend |
 
 ---
 
@@ -50,7 +54,19 @@ tar -xf blender-3.6.9-linux-x64.tar.xz -C ~
 mv ~/blender-3.6.9-linux-x64 ~/blender
 ```
 
-### 3. ADT dataset & DTC object models
+### 3. SAM 2.1
+
+```bash
+git clone https://github.com/facebookresearch/sam2.git
+cd sam2 && pip install -e . --break-system-packages
+
+# Download SAM 2.1 Large weights
+mkdir -p sam2_weights
+wget -O sam2_weights/sam2.1_hiera_large.pt \
+    https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+```
+
+### 4. ADT dataset & DTC object models
 
 Follow the [Project Aria download instructions](https://facebookresearch.github.io/projectaria_tools/docs/data_formats/aria_digital_twin/aria_digital_twin) to obtain:
 
@@ -66,6 +82,13 @@ Then run:
     -o /path/to/ADT \
     -l Apartment_release_golden_skeleton_seq100_10s_sample_M1292 \
     -d main_recording groundtruth synthetic
+
+# Segmentation ground truth (stream 400-1, 1408×1408 uint64 instance IDs)
+~/.local/bin/aria_dataset_downloader \
+    -c ADT_download_urls.json \
+    -o /path/to/ADT \
+    -l Apartment_release_golden_skeleton_seq100_10s_sample_M1292 \
+    -d 1
 
 # 3D object models (~400 GLB files)
 ~/.local/bin/dtc_object_downloader \
@@ -86,9 +109,19 @@ BLENDER_BIN = '/path/to/blender/blender'
 BLEND_SCRIPT= '/path/to/repo/blender_render_scene.py'
 ```
 
+For `run_sam2.py`, update:
+
+```python
+ADT   = '/path/to/ADT/Apartment_release_golden_skeleton_seq100_10s_sample_M1292'
+SAM2  = '/path/to/sam2'          # repo root (for config resolution)
+CKPT  = '/path/to/sam2_weights/sam2.1_hiera_large.pt'
+```
+
 ---
 
 ## Usage
+
+### Blender render pipeline
 
 ```bash
 cd /path/to/ADT
@@ -108,7 +141,7 @@ python render_from_poses_blender.py \
     --output_size 1408 --fisheye
 ```
 
-### Arguments
+#### Arguments
 
 | Argument | Default | Description |
 |---|---|---|
@@ -119,7 +152,7 @@ python render_from_poses_blender.py \
 | `--output_dir DIR` | `{BASE}/blender_rendered` | Output directory |
 | `--fisheye` | off | Remap equirectangular → Aria FISHEYE624 projection |
 
-### Output layout
+#### Output layout
 
 ```
 {output_dir}/
@@ -128,6 +161,40 @@ python render_from_poses_blender.py \
     comparison/    ← side-by-side: real ego-RGB | Blender render
     _remap_512.npz ← cached fisheye LUT (reused across runs)
 ```
+
+### SAM 2 segmentation evaluation
+
+```bash
+cd /path/to/sam2
+python /path/to/repo/run_sam2.py
+```
+
+Outputs saved to `{ADT}/`:
+
+| File | Description |
+|---|---|
+| `real_rot90_f0.png` | Real RGB frame rotated 90° CW to upright orientation |
+| `gt_seg_rot_f0.npy` | GT instance segmentation (1408×1408 uint64), same rotation |
+| `sam2_masks_f0.npy` | SAM 2 predicted masks rescaled to 1408×1408 (shape: N×H×W bool) |
+| `sam2_iou_results.json` | Per-instance best-match IoU and summary metrics |
+| `sam2_report_f0.png` | Visual report: real frame / GT / SAM 2 overlay + IoU table |
+
+#### Results — Frame 0 (SAM 2.1 Large, zero-shot)
+
+| Metric | Value |
+|---|---|
+| GT instances evaluated (≥500 px) | 68 |
+| SAM 2 masks generated | 112 |
+| Mean IoU | **0.501** |
+| Median IoU | **0.555** |
+| IoU ≥ 0.75 (Good) | 20 / 68 (29%) |
+| IoU ≥ 0.50 (Partial) | 38 / 68 (56%) |
+| IoU ≥ 0.25 (Weak) | 47 / 68 (69%) |
+
+Strong matches: cabinet doors (0.92–0.95), WoodenBowl (0.905), ChoppingBoard (0.927).  
+Failures: large background instances (ApartmentEnv 0.228, KitchIsland 0.094) where SAM splits the region, and small objects below ~700 px.
+
+> **Note on image orientation:** The Aria RGB camera stream is rotated 90° CCW from natural upright. All scripts apply `np.rot90(arr, k=-1)` (90° CW) before processing or display.
 
 ---
 
@@ -172,6 +239,14 @@ Blender cannot render the Kannala-Brandt fisheye model natively. The pipeline us
 
 The LUT is cached as `_remap_{output_size}.npz` and reused on subsequent runs.
 
+### SAM 2 memory considerations
+
+SAM 2.1 Large requires significant RAM. On machines with limited memory (~4 GB):
+
+- Resize input to 1024×1024 (SAM 2's native resolution) before inference
+- Set `crop_n_layers=0` and `points_per_batch=32` to reduce peak memory
+- Rescale predicted masks back to original resolution (1408×1408) using nearest-neighbour after inference
+
 ---
 
 ## File Reference
@@ -180,6 +255,9 @@ The LUT is cached as `_remap_{output_size}.npz` and reused on subsequent runs.
 |---|---|
 | `render_from_poses_blender.py` | Driver script — reads ADT CSVs, exports per-frame JSON, calls Blender, applies fisheye remap |
 | `blender_render_scene.py` | Blender headless script — imports GLB objects, sets camera pose, renders Cycles |
+| `render_from_poses.py` | Lightweight CPU pose renderer (no Blender dependency) |
+| `rectify_pipeline.py` | Equirectangular → FISHEYE624 remap via Newton-Raphson LUT |
+| `run_sam2.py` | SAM 2.1 Large automatic mask generation + IoU evaluation against ADT GT |
 
 ---
 
