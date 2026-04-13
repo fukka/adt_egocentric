@@ -1,4 +1,4 @@
-# apt_egocentric
+# adt_egocentric
 
 Render photorealistic egocentric fisheye images from [Aria Digital Twin (ADT)](https://www.projectaria.com/datasets/adt/) ground-truth poses using Blender 3.6 and the Aria FISHEYE624 camera model. Also includes a SAM 2.1 Large segmentation evaluation pipeline against ADT ground-truth instance segmentation.
 
