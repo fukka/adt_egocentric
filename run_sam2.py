@@ -87,10 +87,8 @@ os.chdir(SAM2_DIR)   # Hydra requires cwd == sam2 repo root for config lookup
 
 from sam2.build_sam import build_sam2
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
-from projectaria_tools.projects.adt import (
-    AriaDigitalTwinDataProvider,
-    AriaDigitalTwinDataPathsProvider,
-)
+from projectaria_tools.core import data_provider
+from projectaria_tools.core.stream_id import StreamId
 
 # ── Constants ───────────────────────────────────────────────────────────────
 FRAME_IDX     = 0      # which RGB frame to evaluate (0 = first frame)
@@ -106,16 +104,11 @@ MAP_THRESHOLDS = np.arange(0.50, 1.00, 0.05)  # 0.50, 0.55, …, 0.95
 print("=" * 60)
 print("Step 1: Loading real RGB frame from ADT")
 
-paths    = AriaDigitalTwinDataPathsProvider(ADT_DIR)
-provider = AriaDigitalTwinDataProvider(paths)
-
 # Stream 214-1 = Aria left-RGB camera (1408×1408, fisheye)
-rgb_stream = provider.get_aria_stream_id_from_label('camera-rgb')
-timestamps = provider.get_aria_device_capture_timestamps_ns(rgb_stream)
-
-ts_ns  = timestamps[FRAME_IDX]
-result = provider.get_aria_image_by_timestamp_ns(ts_ns, rgb_stream)
-raw    = result.data().to_numpy_array()   # (1408, 1408, 3) uint8, sideways
+p_ego    = data_provider.create_vrs_data_provider(f'{ADT_DIR}/main_recording.vrs')
+img_data = p_ego.get_image_data_by_index(StreamId('214-1'), FRAME_IDX)
+ts_ns    = img_data[1].capture_timestamp_ns
+raw      = img_data[0].to_numpy_array()   # (1408, 1408, 3) uint8, sideways
 
 # The Aria RGB camera is mounted 90° CCW from natural upright.
 # Rotate 90° CW (k=-1) to restore the upright orientation used throughout.
@@ -131,9 +124,9 @@ print(f"  Saved real_rot90_f0.png  shape={real_rot.shape}")
 print("\nStep 2: Loading GT instance segmentation")
 
 # Stream 400-1 = per-pixel uint64 instance ID for the RGB camera
-seg_stream = provider.get_segmentation_stream_id_from_label('camera-rgb')
-seg_result = provider.get_segmentation_image_by_timestamp_ns(ts_ns, seg_stream)
-seg_raw    = seg_result.data().to_numpy_array()   # (1408, 1408) uint64
+p_seg    = data_provider.create_vrs_data_provider(f'{ADT_DIR}/segmentations.vrs')
+seg_data = p_seg.get_image_data_by_index(StreamId('400-1'), FRAME_IDX)
+seg_raw  = seg_data[0].to_numpy_array()   # (1408, 1408) uint64
 
 # Same 90° CW rotation — numpy is used here because PIL cannot handle uint64
 gt_seg = np.rot90(seg_raw, k=-1).copy()
@@ -144,14 +137,19 @@ n_instances = len(unique_ids[unique_ids != 0])
 print(f"  Saved gt_seg_rot_f0.npy  instances={n_instances}  "
       f"shape={gt_seg.shape}  dtype={gt_seg.dtype}")
 
-# Build a name lookup: instance UID → object name from ADT metadata
+# Build a name lookup: instance UID → object name from instances.json
 uid_to_name = {}
 try:
-    obj_labels = provider.get_object_labels()
-    for lbl in obj_labels:
-        uid_to_name[lbl.instance_id] = lbl.name
-except Exception:
-    pass   # gracefully fall back to raw UID strings
+    with open(f'{ADT_DIR}/groundtruth/instances.json') as _f:
+        _instances = json.load(_f)
+    uid_to_name = {
+        info['instance_id']: info.get('instance_name', str(info['instance_id']))
+        for info in _instances.values()
+        if 'instance_id' in info
+    }
+    print(f"  Loaded {len(uid_to_name)} instance names from instances.json")
+except Exception as e:
+    print(f"  Warning: could not load instance names ({e}); using raw UIDs")
 
 
 # ════════════════════════════════════════════════════════════════════════════
