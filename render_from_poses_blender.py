@@ -11,7 +11,7 @@ Usage:
                                         [--output_size S] [--focal F]
 """
 
-import sys, os, csv, json, argparse, subprocess
+import sys, os, csv, json, argparse, subprocess, struct
 sys.path.insert(0, '/sessions/dreamy-modest-brown/.local/lib/python3.10/site-packages')
 
 import numpy as np
@@ -35,24 +35,83 @@ FLIP_YZ = np.diag([1.0, -1.0, -1.0, 1.0])
 
 # ── Object rotation convention fix ─────────────────────────────────────────
 # ADT T_WO quaternions encode object orientation assuming the object's
-# canonical "standing axis" is local +Z. But GLTF models use the glTF 2.0
-# Y-up convention (standing axis = local +Y).
-# Fix: post-multiply the rotation by R_x(-90°) to rotate the model's local
-# frame so that +Y becomes the new +Z (the axis ADT expects).
+# canonical "standing axis" is local +Z.  Most GLB object models are authored
+# in the glTF 2.0 Y-up convention (standing axis = local +Z of the mesh data).
+#
+# Standard fix (no baked rotation in GLB root node):
+#   T_corrected = T_WO_adt @ R_x(-90°)
 #   R_x(-90°) = [[1, 0,  0],
 #                [0, 0,  1],
 #                [0,-1,  0]]
-# Result: R_correct[:,2] = R_current @ [0,1,0]^T = R_current[:,1]
-# For the bowl: R_bowl[:,1] = [0,1,0] → opening now points up  ✓
+#   Effect: local +Z of mesh → world +Y (gravity-opposite = "up")  ✓
+#
+# Some GLB files have an additional rotation baked into the root node transform
+# (visible in the glTF JSON as nodes[0].rotation).  Blender's GLTF importer
+# sets matrix_world = baked_node_rotation, but our pipeline overwrites
+# matrix_world entirely, so the baked rotation is silently discarded.
+# To restore it we must compose it INTO the correction:
+#
+#   T_corrected = T_WO_adt @ R_x(-90°) @ R_baked
+#
+# Derivation:
+#   We want: vertex_world = T_WO_adt @ R_x(-90°) @ (R_baked @ vertex_prebaked)
+#   Blender applies: matrix_world @ vertex_prebaked
+#   ∴ matrix_world = T_WO_adt @ R_x(-90°) @ R_baked
+#
+# For objects without a baked rotation R_baked = I → same as before.
+#
+# Known affected model:
+#   WhiteFlatwareTray.glb — baked R_y(+90°) ≈ [[0,0,1],[0,1,0],[-1,0,0]]
+#   Pre-baked face-normal is along local −X; R_y(90°) rotates it to +Z;
+#   R_x(-90°) then maps +Z → +Y (world up). Without absorbing R_baked the
+#   face-normal stays along −X in the render → tray appears vertical. ✗
+
 R_x_neg90 = np.array([[1, 0,  0],
                        [0, 0,  1],
                        [0,-1,  0]], dtype=float)
 
-def correct_object_rotation(T_WO):
-    """Post-multiply rotation by R_x(-90°): converts GLTF Y-up local frame
-    to the Z-up convention that ADT T_WO quaternions expect."""
+# Cache of glb_path → baked 3×3 rotation matrix read from GLB JSON chunk.
+_glb_baked_rotation_cache: dict = {}
+
+def _read_glb_baked_rotation(glb_path: str) -> np.ndarray:
+    """Return the root node's baked rotation as a 3×3 matrix (identity if none).
+
+    glTF stores the root node's local transform in the JSON chunk.  The
+    'rotation' field is a quaternion [x, y, z, w].  For most DTC objects this
+    field is absent (≡ identity); some models ship with a pre-applied rotation.
+    """
+    if glb_path in _glb_baked_rotation_cache:
+        return _glb_baked_rotation_cache[glb_path]
+    R = np.eye(3)
+    try:
+        with open(glb_path, 'rb') as f:
+            f.read(12)                               # magic + version + length
+            chunk_len = struct.unpack('<I', f.read(4))[0]
+            f.read(4)                                # chunk type 'JSON'
+            gltf = json.loads(f.read(chunk_len))
+        nodes = gltf.get('nodes', [])
+        if nodes and 'rotation' in nodes[0]:
+            q = nodes[0]['rotation']                 # [x, y, z, w]
+            R = Rotation.from_quat(q).as_matrix()
+    except Exception:
+        pass
+    _glb_baked_rotation_cache[glb_path] = R
+    return R
+
+def correct_object_rotation(T_WO, glb_path: str | None = None):
+    """Post-multiply rotation by R_x(-90°) @ R_baked to produce the correct
+    world matrix for a GLB object.
+
+    Args:
+        T_WO:     4×4 ADT world-from-object transform (numpy).
+        glb_path: Path to the .glb file; used to read any baked root-node
+                  rotation.  Pass None to skip (equivalent to R_baked = I).
+
+    Returns corrected 4×4 matrix ready to pass as Blender matrix_world.
+    """
+    R_baked = _read_glb_baked_rotation(glb_path) if glb_path else np.eye(3)
     T_c = T_WO.copy()
-    T_c[:3, :3] = T_WO[:3, :3] @ R_x_neg90
+    T_c[:3, :3] = T_WO[:3, :3] @ R_x_neg90 @ R_baked
     return T_c
 
 
@@ -179,10 +238,14 @@ def nearest_pose(traj, ts_arr, ts_us):
 def load_all_object_poses(path):
     """Load static (timestamp=-1) AND dynamic (timestamped) object poses.
 
+    Poses are returned as RAW ADT T_WO matrices (no rotation correction
+    applied yet).  Correction (R_x_neg90 @ R_baked) is applied per-object
+    in build_object_list() once the GLB path is known, so that the baked
+    node rotation in each GLB can be read and absorbed correctly.
+
     Returns:
-        static_poses  : {uid: T_WO}  — objects fixed in the scene
-        dynamic_poses : {uid: [(ts_ns, T_WO), ...]}  — objects that move;
-                        each uid maps to a list sorted by timestamp (ns).
+        static_poses  : {uid: T_WO_raw}  — objects fixed in the scene
+        dynamic_poses : {uid: [(ts_ns, T_WO_raw), ...]}  — moving objects
     """
     static_poses  = {}
     dynamic_poses = {}   # uid -> [(ts_ns, T_WO), ...]
@@ -196,7 +259,9 @@ def load_all_object_poses(path):
                 float(row['t_wo_z[m]']),
                 float(row['q_wo_x']),   float(row['q_wo_y']),
                 float(row['q_wo_z']),   float(row['q_wo_w']))
-            T = correct_object_rotation(T)
+            # NOTE: do NOT apply correct_object_rotation here — we need the
+            # GLB path first (known only in build_object_list) to read the
+            # baked node rotation before applying the full correction.
             if ts_ns == -1:
                 static_poses[uid] = T
             else:
@@ -220,13 +285,17 @@ def resolve_dynamic_poses(dynamic_poses, frame_ts_ns):
 def build_object_list(instances, obj_poses, models_dir):
     """Return list of {glb_path, T_WO} for objects that have a GLB model.
 
+    Applies correct_object_rotation(T_WO, glb_path) here, after the GLB path
+    is resolved, so that any baked node rotation stored in the GLB's JSON chunk
+    is read and absorbed into the world matrix (R_x_neg90 @ R_baked).
+
     GLB lookup order:
       1. {instance_name}.glb  (DTC variant files, e.g. "Hook_4.glb")
       2. {prototype_name}.glb  (directly-named files, e.g. "KitchIsland.glb")
     """
     uid_to_info = {str(v['instance_id']): v for v in instances.values()}
     result = []
-    for uid, T_WO in obj_poses.items():
+    for uid, T_WO_raw in obj_poses.items():
         info = uid_to_info.get(uid)
         if info is None:
             continue
@@ -241,8 +310,10 @@ def build_object_list(instances, obj_poses, models_dir):
                     glb_path = p
                     break
         if glb_path:
+            # Apply full rotation correction (R_x_neg90 @ R_baked_from_glb)
+            T_WO_corrected = correct_object_rotation(T_WO_raw, glb_path)
             result.append({'glb_path': glb_path,
-                           'T_WO': T_WO.flatten().tolist()})
+                           'T_WO': T_WO_corrected.flatten().tolist()})
     return result
 
 
