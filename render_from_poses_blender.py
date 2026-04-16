@@ -17,6 +17,7 @@ sys.path.insert(0, '/sessions/dreamy-modest-brown/.local/lib/python3.10/site-pac
 import numpy as np
 from scipy.spatial.transform import Rotation
 from PIL import Image
+import os as _os; _os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')  # enable EXR read
 import cv2
 
 from projectaria_tools.core import data_provider
@@ -384,7 +385,7 @@ def build_scene_lights(scene_objects_csv, instances_json_path):
 
 
 def build_object_list(instances, obj_poses, models_dir):
-    """Return list of {glb_path, T_WO} for objects that have a GLB model.
+    """Return list of {glb_path, T_WO, uid} for objects that have a GLB model.
 
     Applies correct_object_rotation(T_WO, glb_path) here, after the GLB path
     is resolved, so that any baked node rotation stored in the GLB's JSON chunk
@@ -402,7 +403,6 @@ def build_object_list(instances, obj_poses, models_dir):
             continue
         instance_name  = info.get('instance_name', '')
         prototype_name = info.get('prototype_name', '')
-        # Try instance-specific GLB first, then prototype GLB
         glb_path = None
         for candidate in [instance_name, prototype_name]:
             if candidate:
@@ -411,11 +411,23 @@ def build_object_list(instances, obj_poses, models_dir):
                     glb_path = p
                     break
         if glb_path:
-            # Apply full rotation correction (R_x_neg90 @ R_baked_from_glb)
             T_WO_corrected = correct_object_rotation(T_WO_raw, glb_path)
             result.append({'glb_path': glb_path,
-                           'T_WO': T_WO_corrected.flatten().tolist()})
+                           'T_WO':     T_WO_corrected.flatten().tolist(),
+                           'uid':      uid})   # ← instance UID for seg mapping
     return result
+
+
+def colorize_seg(seg_uid):
+    """Map instance UIDs to stable RGB colours (hash-based) for visualisation."""
+    import hashlib
+    vis = np.zeros((*seg_uid.shape, 3), dtype=np.uint8)
+    for uid in np.unique(seg_uid):
+        if uid == 0:
+            continue
+        d = hashlib.md5(str(uid).encode()).digest()
+        vis[seg_uid == uid] = (d[0], d[1], d[2])
+    return vis
 
 
 def main():
@@ -435,8 +447,9 @@ def main():
                              'Aria FISHEYE624 projection (exact lens match)')
     args = parser.parse_args()
 
-    os.makedirs(f'{args.output_dir}/rgb',        exist_ok=True)
-    os.makedirs(f'{args.output_dir}/comparison', exist_ok=True)
+    os.makedirs(f'{args.output_dir}/rgb',          exist_ok=True)
+    os.makedirs(f'{args.output_dir}/comparison',   exist_ok=True)
+    os.makedirs(f'{args.output_dir}/segmentation', exist_ok=True)
     tmp_dir = f'{args.output_dir}/_tmp'
     os.makedirs(tmp_dir, exist_ok=True)
 
@@ -537,6 +550,15 @@ def main():
         print(f'    Distance-culled to {len(visible_objects)} objects '
               f'({n_dyn} dynamic, max dist: {objs_with_dist[min(79,len(objs_with_dist)-1)][0]:.1f}m)')
 
+        # Assign sequential pass_index values (1-based; 0 = background) for seg mask
+        pass_idx_to_uid: dict[int, int] = {}
+        for i, obj in enumerate(visible_objects):
+            obj['pass_index'] = i + 1
+            try:
+                pass_idx_to_uid[i + 1] = int(obj.get('uid', 0))
+            except (ValueError, TypeError):
+                pass_idx_to_uid[i + 1] = 0
+
         # Write per-frame JSON
         frame_data = {
             'image_width':    args.output_size,
@@ -550,6 +572,7 @@ def main():
             'equirect_height': EQ_H if args.fisheye else args.output_size,
             # Equirect renders downsample via remap → fewer samples still look good
             'cycles_samples':  16 if args.fisheye else 32,
+            'pass_idx_to_uid': {str(k): v for k, v in pass_idx_to_uid.items()},
         }
         json_path = f'{tmp_dir}/frame_{idx:04d}.json'
         with open(json_path, 'w') as f:
@@ -562,11 +585,17 @@ def main():
         else:
             blender_out = out_png
 
+        # Segmentation EXR path (inside tmp; renamed to final location after render)
+        seg_exr_tmp  = f'{tmp_dir}/seg_{idx:04d}.exr'
+        seg_npy_out  = f'{args.output_dir}/segmentation/frame_{idx:04d}.npy'
+        seg_vis_out  = f'{args.output_dir}/segmentation/frame_{idx:04d}_vis.png'
+
         # Call Blender
         print(f'  [{count+1}/{len(frames_idx)}] Rendering frame {idx:04d}...')
         cmd = [
             BLENDER_BIN, '--background', '--python', BLEND_SCRIPT,
-            '--', '--frame_data', json_path, '--output', blender_out
+            '--', '--frame_data', json_path, '--output', blender_out,
+            '--seg_output', seg_exr_tmp,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
@@ -588,6 +617,42 @@ def main():
             render_img = fish_arr
         else:
             render_img = np.array(Image.open(out_png).convert('RGB'))
+
+        # ── Segmentation post-processing ────────────────────────────────────
+        if os.path.exists(seg_exr_tmp):
+            # Load float32 EXR (RGB; IndexOB value is broadcast to R=G=B channels)
+            seg_raw3  = cv2.imread(seg_exr_tmp,
+                                   cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
+            seg_float = seg_raw3[..., 0] if seg_raw3 is not None else None  # R channel
+            if seg_float is None:
+                print(f'    [seg] cv2 could not read {seg_exr_tmp}; skipping seg')
+            else:
+                if args.fisheye and fisheye_remap is not None:
+                    # Remap equirect seg → fisheye using nearest-neighbour
+                    # (must NOT interpolate class IDs)
+                    map_x_s, map_y_s, valid_s = fisheye_remap
+                    seg_float = cv2.remap(seg_float, map_x_s, map_y_s,
+                                          interpolation=cv2.INTER_NEAREST,
+                                          borderMode=cv2.BORDER_CONSTANT,
+                                          borderValue=0.0)
+                    seg_float[~valid_s] = 0.0
+
+                # Convert float pass_index → int64 instance UID
+                pass_arr = np.round(seg_float).astype(np.int32)
+                seg_uid  = np.zeros(pass_arr.shape, dtype=np.int64)
+                for pidx_s, uid_s in pass_idx_to_uid.items():
+                    seg_uid[pass_arr == pidx_s] = uid_s
+
+                # Rotate to display orientation (same rot90 CW as RGB frames)
+                seg_uid = np.rot90(seg_uid, k=-1).copy()
+
+                # Save NPY (int64 instance UIDs) + colourised PNG
+                np.save(seg_npy_out, seg_uid)
+                Image.fromarray(colorize_seg(seg_uid)).save(seg_vis_out)
+                n_objs = len(np.unique(seg_uid)) - 1   # exclude background
+                print(f'    Segmentation: {n_objs} objects → {seg_npy_out}')
+        else:
+            print(f'    [seg] EXR not found at {seg_exr_tmp}')
 
         # Side-by-side: ego (resized) | blender render
         ego_img = np.array(Image.fromarray(ego_rgb).resize(
