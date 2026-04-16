@@ -79,30 +79,59 @@ bg.inputs[0].default_value = (0.85, 0.78, 0.65, 1.0)   # warm indoor tint
 bg.inputs[1].default_value = 0.04                        # nearly dark — enclosed room
 scene.world = world
 
-# ── Interior point lights scattered near the camera ───────────────────────
-# Match ADT synthetic indoor lighting: warm, moderate energy, soft shadows.
-T_WC_adt_early = np.array(data['camera_pose']).reshape(4, 4)
-T_WC_bl_early  = T_WC_adt_early @ FLIP_YZ
-cam_xyz = T_WC_bl_early[:3, 3].tolist()
-# One main overhead light centred above the scene + a couple fill lights
-for (dx, dy, dz, energy) in [
-        ( 0,  0,  1.5, 15.0),   # overhead main
-        ( 0,  2,  0.8,  7.0),   # fill forward
-        (-1, -1,  0.5,  5.0),   # fill left-back
-        ( 1, -1,  0.5,  5.0),   # fill right-back
-]:
+# ── Scene-fixed lights from ADT prop positions + ceiling grid ─────────────
+# Lights are supplied by render_from_poses_blender.py in scene_lights[]:
+#   POINT — physical lamp/candle props at their world positions
+#   AREA  — ceiling tiles approximating Unreal's baked indoor GI
+#
+# All coordinates are in ADT Y-up world space.  The scene geometry (GLBs)
+# is also in ADT Y-up space (Blender GLTF importer kept identity world
+# transform), so we place lights directly at the ADT coordinates without
+# any extra conversion.
+#
+# Fallback: if scene_lights is absent (old JSON / manual run) we add a
+# single soft overhead light above the camera as a safety default.
+scene_lights = data.get('scene_lights', [])
+
+if scene_lights:
+    for ldef in scene_lights:
+        loc   = tuple(ldef['location'])      # (x, y, z) in ADT Y-up world
+        col   = tuple(ldef.get('color', [1.0, 0.90, 0.75]))
+        eng   = ldef.get('energy', 10.0)
+        ltype = ldef.get('type', 'POINT')
+
+        if ltype == 'AREA':
+            bpy.ops.object.light_add(type='AREA', location=loc)
+            light = bpy.context.object.data
+            light.energy = eng
+            light.color  = col
+            light.size   = ldef.get('size', 1.8)
+            # Area light emits along local -Z.  In our world (ADT Y-up),
+            # "down" = world -Y.  Rx(-90°) maps local -Z → world -Y:
+            #   Rx(-90°) * [0,0,-1] = [0, -1, 0]  ✓
+            bpy.context.object.rotation_euler = (-math.pi / 2, 0, 0)
+        else:  # POINT
+            bpy.ops.object.light_add(type='POINT', location=loc)
+            light = bpy.context.object.data
+            light.energy           = eng
+            light.color            = col
+            light.shadow_soft_size = ldef.get('radius', 0.10)
+else:
+    # Safety fallback — single warm overhead light 1.5m above camera
+    T_WC_adt_early = np.array(data['camera_pose']).reshape(4, 4)
+    cam_xyz        = (T_WC_adt_early @ FLIP_YZ)[:3, 3].tolist()
     bpy.ops.object.light_add(type='POINT',
-                              location=(cam_xyz[0]+dx, cam_xyz[1]+dy, cam_xyz[2]+dz))
+                              location=(cam_xyz[0], cam_xyz[1] + 1.5, cam_xyz[2]))
     light = bpy.context.object.data
-    light.energy = energy
-    light.color  = (1.0, 0.92, 0.78)   # warm white (≈3000 K)
-    light.shadow_soft_size = 0.8
+    light.energy           = 30.0
+    light.color            = (1.0, 0.92, 0.78)
+    light.shadow_soft_size = 1.0
 
 # ── Colour management / exposure ─────────────────────────────────────────
 # Match ADT synthetic: dark indoor exposure, Filmic tone-map.
 scene.view_settings.view_transform = 'Filmic'
 scene.view_settings.look            = 'Medium Low Contrast'
-scene.view_settings.exposure        = -0.7   # darken overall to match real scene
+scene.view_settings.exposure        = -0.3   # adjusted to match ADT synthetic brightness
 scene.view_settings.gamma           =  1.0
 
 # ── Import GLB objects at world poses ─────────────────────────────────────

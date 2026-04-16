@@ -282,6 +282,107 @@ def resolve_dynamic_poses(dynamic_poses, frame_ts_ns):
         resolved[uid] = entries[idx][1]
     return resolved
 
+def build_scene_lights(scene_objects_csv, instances_json_path):
+    """Build a list of scene-fixed lights for Blender from two sources:
+
+    1. Physical lamp props in scene_objects.csv (Lamp_1, WhitTableLamp,
+       NightLights, Candles) — placed as POINT lights at their world positions.
+
+    2. Hardcoded ceiling AREA lights covering the apartment — approximating
+       Unreal Engine's baked overhead room lighting which has no counterpart
+       file in the ADT dataset.  Ceiling height ≈ 2.35m (SecurityCamera at
+       2.41m is the tallest tracked object; apartment ceiling ≈ 2.5m).
+
+    All positions are in ADT Y-up world coordinates (same as T_WO).
+    The Blender script places lights directly at these world coordinates
+    (no coordinate-system conversion needed — scene geometry is already
+    imported in ADT coords).
+
+    Returns a list of dicts with keys:
+        type     : 'POINT' or 'AREA'
+        location : [x, y, z]   in ADT world coords (Y-up)
+        energy   : float        Watts (Cycles)
+        color    : [r, g, b]   linear
+        radius   : float        (POINT only) soft shadow radius in metres
+        size     : float        (AREA only)  side length in metres
+    """
+    with open(instances_json_path) as f:
+        instances = json.load(f)
+    uid_to_name = {info['instance_id']: info.get('instance_name', '')
+                   for info in instances.values() if 'instance_id' in info}
+
+    # ── Prop lights: energy/colour per object type ────────────────────────
+    # Night lights / table lamps: warm, moderate energy
+    # Candles: very warm, low energy
+    PROP_LIGHT_CFG = {
+        'Lamp':          {'energy': 20.0, 'color': [1.0, 0.88, 0.70], 'radius': 0.15},
+        'WhitTableLamp': {'energy': 15.0, 'color': [1.0, 0.90, 0.72], 'radius': 0.12},
+        'NightLight':    {'energy':  4.0, 'color': [1.0, 0.80, 0.60], 'radius': 0.05},
+        'Candle':        {'energy':  1.5, 'color': [1.0, 0.70, 0.40], 'radius': 0.02},
+    }
+
+    def cfg_for(name):
+        for key, cfg in PROP_LIGHT_CFG.items():
+            if key.lower() in name.lower():
+                return cfg
+        return None
+
+    lights = []
+    with open(scene_objects_csv) as f:
+        for row in csv.DictReader(f):
+            if row['timestamp[ns]'] != '-1':
+                continue
+            uid  = int(row['object_uid'])
+            name = uid_to_name.get(uid, '')
+            cfg  = cfg_for(name)
+            if cfg is None:
+                continue
+            x = float(row['t_wo_x[m]'])
+            y = float(row['t_wo_y[m]'])
+            z = float(row['t_wo_z[m]'])
+            # Lamp_1 / WhitTableLamp: shift light slightly above the prop mesh
+            y_offset = 0.30 if 'Lamp' in name else 0.10
+            lights.append({
+                'type':     'POINT',
+                'location': [x, y + y_offset, z],
+                'energy':   cfg['energy'],
+                'color':    cfg['color'],
+                'radius':   cfg['radius'],
+            })
+            print(f'    prop light: {name:<30} ({x:.2f}, {y:.2f}, {z:.2f})')
+
+    # ── Ceiling AREA lights — approximate Unreal baked GI ─────────────────
+    # The ADT Apartment spans roughly X∈[-4,3], Z∈[-4,9].
+    # Two zones observed from scene geometry:
+    #   Kitchen/entry  (X∈[-1,2], Z∈[-1,4]) — bowl and counters here
+    #   Living/bedroom (X∈[-4,0], Z∈[-4,3]) — sofa, bed, shelves
+    # Six 2×2m area lights cover the floor plan.  All at Y=2.35m (just below
+    # ceiling).  Warm-white colour ≈ 3000 K (indoor tungsten/LED).
+    CEIL_Y      = 2.35   # metres
+    CEIL_ENERGY = 22.0   # Watts — calibrated to match ADT mean brightness ~66/255
+    CEIL_COLOR  = [1.0, 0.90, 0.75]   # warm indoor white
+    CEIL_SIZE   = 1.8    # metres — each tile covers a 1.8×1.8m patch
+    for (cx, cz) in [
+        ( 0.5,  2.5),   # above kitchen counter / WoodenBowl
+        ( 0.5,  0.5),   # kitchen island / entry
+        (-1.0, -1.5),   # living-room sofa area
+        (-1.0,  4.5),   # dining / far kitchen
+        (-2.5, -2.5),   # bedroom / hallway
+        (-2.5,  1.5),   # living centre
+    ]:
+        lights.append({
+            'type':     'AREA',
+            'location': [cx, CEIL_Y, cz],
+            'energy':   CEIL_ENERGY,
+            'color':    CEIL_COLOR,
+            'size':     CEIL_SIZE,
+        })
+
+    print(f'  Scene lights: {sum(1 for l in lights if l["type"]=="POINT")} prop points + '
+          f'{sum(1 for l in lights if l["type"]=="AREA")} ceiling area lights')
+    return lights
+
+
 def build_object_list(instances, obj_poses, models_dir):
     """Return list of {glb_path, T_WO} for objects that have a GLB model.
 
@@ -383,6 +484,10 @@ def main():
     traj, ts_arr  = load_trajectory(f'{GT_DIR}/aria_trajectory.csv')
     static_poses, dynamic_poses = load_all_object_poses(f'{GT_DIR}/scene_objects.csv')
 
+    print('Building scene lights from prop positions + ceiling grid...')
+    scene_lights = build_scene_lights(f'{GT_DIR}/scene_objects.csv',
+                                      f'{GT_DIR}/instances.json')
+
     static_object_list = build_object_list(instances, static_poses, MODELS_DIR)
     print(f'  Static objects with GLB models : {len(static_object_list)}')
     print(f'  Static obj poses               : {len(static_poses)}')
@@ -439,6 +544,7 @@ def main():
             'focal_px':       args.focal,
             'camera_pose':    T_WC.flatten().tolist(),
             'object_models':  visible_objects,
+            'scene_lights':   scene_lights,
             'use_equirect':   args.fisheye,
             'equirect_width':  EQ_W if args.fisheye else args.output_size,
             'equirect_height': EQ_H if args.fisheye else args.output_size,
