@@ -174,41 +174,85 @@ for img in bpy.data.images:
 
 # ── Compositor: segmentation Object-Index pass ────────────────────────────
 # Only activated when --seg_output is given.
-# Sets up:
-#   RenderLayers.Image      → Composite  (drives write_still for RGB)
-#   RenderLayers.IndexOB    → FileOutput → EXR float32 BW
-# Blender appends a zero-padded frame number to the FileOutput path; the
-# driver script renames the resulting file to --seg_output afterward.
+#
+# Problem with single-ViewLayer approach:
+#   Cycles treats transparent/glass materials (blend_method BLEND or HASHED)
+#   as partially transparent per-ray. The IndexOB pass honours this: transparent
+#   pixels "miss" the glass surface and record whatever is behind it (or 0 for
+#   background). With HASHED sampling this produces a dotted pattern because
+#   some rays hit the glass and some don't, depending on the dithering seed.
+#
+# Fix — two ViewLayers in one render call:
+#   Main  : normal materials, glass transparent → drives RGB write_still output
+#   Seg   : material_override = fully opaque diffuse → all surfaces solid →
+#           IndexOB correctly records every glass/transparent mesh pixel
+#
+# Compositor wiring:
+#   Main.Image  → Composite    (RGB output)
+#   Seg.IndexOB → FileOutput   (EXR segmentation)
+#
+# Blender renders both layers in a single bpy.ops.render.render() call.
+# write_still writes Main's image (the active ViewLayer output).
 if args.seg_output:
-    vl = scene.view_layers[0]
-    vl.use_pass_object_index = True
+    # ── Main ViewLayer (RGB) ───────────────────────────────────────────────
+    vl_main = scene.view_layers[0]
+    vl_main.name = 'Main'
+    vl_main.use_pass_object_index = False  # not needed for RGB
 
+    # ── Seg ViewLayer: fully opaque override so glass pixels get indexed ───
+    # We create a simple opaque diffuse material and assign it as the
+    # ViewLayer's material_override.  This replaces all shaders at render
+    # time (geometry is unchanged), turning every surface opaque so that
+    # Cycles rays always hit the glass mesh and record its pass_index.
+    seg_override = bpy.data.materials.new('_SEG_OPAQUE_OVERRIDE')
+    seg_override.use_nodes = True
+    _sn = seg_override.node_tree.nodes
+    _sn.clear()
+    _so = _sn.new('ShaderNodeOutputMaterial')
+    _sd = _sn.new('ShaderNodeBsdfDiffuse')
+    _sd.inputs['Color'].default_value = (0.5, 0.5, 0.5, 1.0)
+    seg_override.node_tree.links.new(_sd.outputs['BSDF'], _so.inputs['Surface'])
+    seg_override.blend_method   = 'OPAQUE'
+    seg_override.shadow_method  = 'OPAQUE'
+
+    vl_seg = scene.view_layers.new('Seg')
+    vl_seg.use_pass_object_index = True
+    vl_seg.material_override     = seg_override
+
+    # ── Compositor ────────────────────────────────────────────────────────
     scene.use_nodes = True
     scene.render.use_compositing = True
     tree = scene.node_tree
     tree.nodes.clear()
 
-    rl   = tree.nodes.new('CompositorNodeRLayers')
+    # Main layer → RGB composite output
+    rl_main = tree.nodes.new('CompositorNodeRLayers')
+    rl_main.layer = 'Main'
     comp = tree.nodes.new('CompositorNodeComposite')
-    tree.links.new(rl.outputs['Image'], comp.inputs['Image'])
+    tree.links.new(rl_main.outputs['Image'], comp.inputs['Image'])
+
+    # Seg layer → IndexOB → EXR file
+    rl_seg = tree.nodes.new('CompositorNodeRLayers')
+    rl_seg.layer = 'Seg'
 
     seg_dir  = os.path.dirname(os.path.abspath(args.seg_output))
     seg_stem = os.path.splitext(os.path.basename(args.seg_output))[0]
     os.makedirs(seg_dir, exist_ok=True)
 
     out_seg = tree.nodes.new('CompositorNodeOutputFile')
-    out_seg.base_path                 = seg_dir + os.sep
-    out_seg.format.file_format        = 'OPEN_EXR'
-    out_seg.format.color_mode         = 'RGB'   # value → R=G=B; read R channel in Python
-    out_seg.format.color_depth        = '32'
-    out_seg.format.exr_codec          = 'NONE'
-    out_seg.file_slots[0].path        = seg_stem
+    out_seg.base_path             = seg_dir + os.sep
+    out_seg.format.file_format    = 'OPEN_EXR'
+    out_seg.format.color_mode     = 'RGB'   # IndexOB value broadcast to R=G=B; read R in Python
+    out_seg.format.color_depth    = '32'
+    out_seg.format.exr_codec      = 'NONE'
+    out_seg.file_slots[0].path    = seg_stem
+
     # IndexOB socket name varies by Blender version
-    idx_socket = (rl.outputs.get('IndexOB') or rl.outputs.get('Object Index'))
+    idx_socket = (rl_seg.outputs.get('IndexOB') or rl_seg.outputs.get('Object Index'))
     if idx_socket:
         tree.links.new(idx_socket, out_seg.inputs[0])
     else:
-        print('[seg] WARNING: IndexOB socket not found — segmentation will be empty')
+        print('[seg] WARNING: IndexOB socket not found on Seg layer — segmentation will be empty')
 
     scene.frame_current = 0   # → suffix "0000" on output filename
 
