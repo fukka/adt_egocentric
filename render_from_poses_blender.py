@@ -607,11 +607,17 @@ def main():
     parser.add_argument('--fisheye',     action='store_true',
                         help='Render equirectangular panorama and remap to '
                              'Aria FISHEYE624 projection (exact lens match)')
+    parser.add_argument('--no_segmentation', action='store_true',
+                        help='Skip instance segmentation output (pass this flag '
+                             'if blender_render_scene.py does not support '
+                             '--seg_output, e.g. older versions of the script)')
     args = parser.parse_args()
+    args.segmentation = not args.no_segmentation
 
     os.makedirs(f'{args.output_dir}/rgb',          exist_ok=True)
     os.makedirs(f'{args.output_dir}/comparison',   exist_ok=True)
-    os.makedirs(f'{args.output_dir}/segmentation', exist_ok=True)
+    if args.segmentation:
+        os.makedirs(f'{args.output_dir}/segmentation', exist_ok=True)
     tmp_dir = f'{args.output_dir}/_tmp'
     os.makedirs(tmp_dir, exist_ok=True)
 
@@ -757,8 +763,9 @@ def main():
         cmd = [
             BLENDER_BIN, '--background', '--python', BLEND_SCRIPT,
             '--', '--frame_data', json_path, '--output', blender_out,
-            '--seg_output', seg_exr_tmp,
         ]
+        if args.segmentation:
+            cmd += ['--seg_output', seg_exr_tmp]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             print(f'    Blender error:\n{result.stderr[-500:]}')
@@ -786,40 +793,41 @@ def main():
             Image.fromarray(render_img).save(out_png)
 
         # ── Segmentation post-processing ────────────────────────────────────
-        if os.path.exists(seg_exr_tmp):
-            # Load float32 EXR (RGB; IndexOB value is broadcast to R=G=B channels)
-            seg_raw3  = cv2.imread(seg_exr_tmp,
-                                   cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
-            seg_float = seg_raw3[..., 0] if seg_raw3 is not None else None  # R channel
-            if seg_float is None:
-                print(f'    [seg] cv2 could not read {seg_exr_tmp}; skipping seg')
+        if args.segmentation:
+            if os.path.exists(seg_exr_tmp):
+                # Load float32 EXR (RGB; IndexOB value is broadcast to R=G=B channels)
+                seg_raw3  = cv2.imread(seg_exr_tmp,
+                                       cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
+                seg_float = seg_raw3[..., 0] if seg_raw3 is not None else None  # R channel
+                if seg_float is None:
+                    print(f'    [seg] cv2 could not read {seg_exr_tmp}; skipping seg')
+                else:
+                    if args.fisheye and fisheye_remap is not None:
+                        # Remap equirect seg → fisheye using nearest-neighbour
+                        # (must NOT interpolate class IDs)
+                        map_x_s, map_y_s, valid_s = fisheye_remap
+                        seg_float = cv2.remap(seg_float, map_x_s, map_y_s,
+                                              interpolation=cv2.INTER_NEAREST,
+                                              borderMode=cv2.BORDER_CONSTANT,
+                                              borderValue=0.0)
+                        seg_float[~valid_s] = 0.0
+
+                    # Convert float pass_index → int64 instance UID
+                    pass_arr = np.round(seg_float).astype(np.int32)
+                    seg_uid  = np.zeros(pass_arr.shape, dtype=np.int64)
+                    for pidx_s, uid_s in pass_idx_to_uid.items():
+                        seg_uid[pass_arr == pidx_s] = uid_s
+
+                    # Rotate to display orientation (same rot90 CW as RGB frames)
+                    seg_uid = np.rot90(seg_uid, k=-1).copy()
+
+                    # Save NPY (int64 instance UIDs) + colourised PNG
+                    np.save(seg_npy_out, seg_uid)
+                    Image.fromarray(colorize_seg(seg_uid)).save(seg_vis_out)
+                    n_objs = len(np.unique(seg_uid)) - 1   # exclude background
+                    print(f'    Segmentation: {n_objs} objects → {seg_npy_out}')
             else:
-                if args.fisheye and fisheye_remap is not None:
-                    # Remap equirect seg → fisheye using nearest-neighbour
-                    # (must NOT interpolate class IDs)
-                    map_x_s, map_y_s, valid_s = fisheye_remap
-                    seg_float = cv2.remap(seg_float, map_x_s, map_y_s,
-                                          interpolation=cv2.INTER_NEAREST,
-                                          borderMode=cv2.BORDER_CONSTANT,
-                                          borderValue=0.0)
-                    seg_float[~valid_s] = 0.0
-
-                # Convert float pass_index → int64 instance UID
-                pass_arr = np.round(seg_float).astype(np.int32)
-                seg_uid  = np.zeros(pass_arr.shape, dtype=np.int64)
-                for pidx_s, uid_s in pass_idx_to_uid.items():
-                    seg_uid[pass_arr == pidx_s] = uid_s
-
-                # Rotate to display orientation (same rot90 CW as RGB frames)
-                seg_uid = np.rot90(seg_uid, k=-1).copy()
-
-                # Save NPY (int64 instance UIDs) + colourised PNG
-                np.save(seg_npy_out, seg_uid)
-                Image.fromarray(colorize_seg(seg_uid)).save(seg_vis_out)
-                n_objs = len(np.unique(seg_uid)) - 1   # exclude background
-                print(f'    Segmentation: {n_objs} objects → {seg_npy_out}')
-        else:
-            print(f'    [seg] EXR not found at {seg_exr_tmp}')
+                print(f'    [seg] EXR not found at {seg_exr_tmp}')
 
         # Side-by-side: ego (resized) | blender render
         ego_img = np.array(Image.fromarray(ego_rgb).resize(
