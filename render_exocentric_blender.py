@@ -376,12 +376,15 @@ def render_camera(cam_name, cam_cfg, frame_ts_ns, all_objects, scene_lights,
 
     print(f'  [{cam_name}] Rendering {tag} — eye {cam_cfg["eye"].tolist()}')
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-    if result.returncode != 0:
-        print(f'  [{cam_name}] Blender error:\n{result.stderr[-600:]}')
-        return
+    # Blender can return non-zero exit codes on certain import warnings while
+    # still writing the output file successfully.  Check the file first.
     if not os.path.exists(out_png):
-        print(f'  [{cam_name}] Output not created. Blender stdout: {result.stdout[-200:]}')
+        print(f'  [{cam_name}] Output not created (returncode={result.returncode}).')
+        if result.stderr:
+            print(f'  stderr: {result.stderr[-800:]}')
         return
+    if result.returncode != 0:
+        print(f'  [{cam_name}] Blender returned {result.returncode} but output exists — continuing.')
 
     print(f'  [{cam_name}] Saved {out_png}')
 

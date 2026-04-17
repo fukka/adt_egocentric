@@ -767,12 +767,15 @@ def main():
         if args.segmentation:
             cmd += ['--seg_output', seg_exr_tmp]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            print(f'    Blender error:\n{result.stderr[-500:]}')
-            continue
+        # Blender can return non-zero exit codes on import warnings while still
+        # writing the output file successfully. Check the file before bailing.
         if not os.path.exists(blender_out):
-            print(f'    Output file not created! Blender stdout: {result.stdout[-200:]}')
+            print(f'    Output not created (returncode={result.returncode}).')
+            if result.stderr:
+                print(f'    stderr: {result.stderr[-500:]}')
             continue
+        if result.returncode != 0:
+            print(f'    Blender returned {result.returncode} but output exists — continuing.')
 
         # Fisheye remap: equirect → FISHEYE624 projection
         if args.fisheye and fisheye_remap is not None:
