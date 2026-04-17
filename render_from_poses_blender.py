@@ -11,7 +11,7 @@ Usage:
                                         [--output_size S] [--focal F]
 """
 
-import sys, os, csv, json, argparse, subprocess, struct
+import sys, os, csv, json, argparse, subprocess
 sys.path.insert(0, '/sessions/dreamy-modest-brown/.local/lib/python3.10/site-packages')
 
 import numpy as np
@@ -61,58 +61,40 @@ FLIP_YZ = np.diag([1.0, -1.0, -1.0, 1.0])
 #
 # For objects without a baked rotation R_baked = I → same as before.
 #
-# Known affected model:
-#   WhiteFlatwareTray.glb — baked R_y(+90°) ≈ [[0,0,1],[0,1,0],[-1,0,0]]
-#   Pre-baked face-normal is along local −X; R_y(90°) rotates it to +Z;
-#   R_x(-90°) then maps +Z → +Y (world up). Without absorbing R_baked the
-#   face-normal stays along −X in the render → tray appears vertical. ✗
+# NOTE (diagnostic finding): Blender's glTF importer bakes any root-node
+# rotation into vertex positions during import.  So after import_scene.gltf,
+# the mesh vertices are already in "post-baked" space and only R_x(-90°) is
+# needed — no additional R_baked term.  Applying R_baked again would
+# double-rotate objects with a baked root-node TRS (verified on
+# WhiteFlatwareTray.glb which has R_y(90°) baked in nodes[0].rotation).
 
 R_x_neg90 = np.array([[1, 0,  0],
                        [0, 0,  1],
                        [0,-1,  0]], dtype=float)
 
-# Cache of glb_path → baked 3×3 rotation matrix read from GLB JSON chunk.
-_glb_baked_rotation_cache: dict = {}
-
-def _read_glb_baked_rotation(glb_path: str) -> np.ndarray:
-    """Return the root node's baked rotation as a 3×3 matrix (identity if none).
-
-    glTF stores the root node's local transform in the JSON chunk.  The
-    'rotation' field is a quaternion [x, y, z, w].  For most DTC objects this
-    field is absent (≡ identity); some models ship with a pre-applied rotation.
-    """
-    if glb_path in _glb_baked_rotation_cache:
-        return _glb_baked_rotation_cache[glb_path]
-    R = np.eye(3)
-    try:
-        with open(glb_path, 'rb') as f:
-            f.read(12)                               # magic + version + length
-            chunk_len = struct.unpack('<I', f.read(4))[0]
-            f.read(4)                                # chunk type 'JSON'
-            gltf = json.loads(f.read(chunk_len))
-        nodes = gltf.get('nodes', [])
-        if nodes and 'rotation' in nodes[0]:
-            q = nodes[0]['rotation']                 # [x, y, z, w]
-            R = Rotation.from_quat(q).as_matrix()
-    except Exception:
-        pass
-    _glb_baked_rotation_cache[glb_path] = R
-    return R
-
 def correct_object_rotation(T_WO, glb_path: str | None = None):
-    """Post-multiply rotation by R_x(-90°) @ R_baked to produce the correct
-    world matrix for a GLB object.
+    """Post-multiply rotation by R_x(-90°) to produce the correct world matrix
+    for a GLB object.
+
+    Blender's glTF importer bakes any root-node rotation from the GLB's JSON
+    chunk directly into vertex positions during import.  When we override
+    matrix_world after import, the vertices are therefore already in the
+    "post-baked" local space.  Applying R_baked a second time would
+    double-rotate the object.  Consequently, we need only R_x(-90°) regardless
+    of whether the GLB has a baked root-node rotation or not.
+
+    R_x(-90°) maps the object's local +Z → world +Y (up in ADT Y-up).  This is
+    the ADT object convention: T_WO represents the object pose assuming its
+    canonical "standing axis" is +Z; R_x(-90°) re-orients that to world +Y.
 
     Args:
         T_WO:     4×4 ADT world-from-object transform (numpy).
-        glb_path: Path to the .glb file; used to read any baked root-node
-                  rotation.  Pass None to skip (equivalent to R_baked = I).
+        glb_path: Retained for API compatibility; no longer used.
 
     Returns corrected 4×4 matrix ready to pass as Blender matrix_world.
     """
-    R_baked = _read_glb_baked_rotation(glb_path) if glb_path else np.eye(3)
     T_c = T_WO.copy()
-    T_c[:3, :3] = T_WO[:3, :3] @ R_x_neg90 @ R_baked
+    T_c[:3, :3] = T_WO[:3, :3] @ R_x_neg90
     return T_c
 
 
