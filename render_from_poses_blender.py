@@ -35,66 +35,90 @@ RGB_STREAM  = StreamId('214-1')
 FLIP_YZ = np.diag([1.0, -1.0, -1.0, 1.0])
 
 # ── Object rotation convention fix ─────────────────────────────────────────
-# ADT T_WO quaternions encode object orientation assuming the object's
-# canonical "standing axis" is local +Z.  Most GLB object models are authored
-# in the glTF 2.0 Y-up convention (standing axis = local +Z of the mesh data).
+# ADT T_WO encodes the transform from the object's CANONICAL frame to world.
+# Each object's canonical frame is documented in instances.json:
+#   "canonical_pose": {"up_vector": [0,1,0], "front_vector": [0,0,1]}
+# i.e. ADT expects canonical local +Y = "up face" and canonical local +Z = "front".
 #
-# Standard fix (no baked rotation in GLB root node):
-#   T_corrected = T_WO_adt @ R_x(-90°)
-#   R_x(-90°) = [[1, 0,  0],
-#                [0, 0,  1],
-#                [0,-1,  0]]
-#   Effect: local +Z of mesh → world +Y (gravity-opposite = "up")  ✓
+# GLB models are exported in glTF 2.0 convention (Y-up, +Z toward viewer).
+# When Blender imports a GLB it converts vertex positions from glTF space to
+# Blender's native space by applying R_x(+90°):
+#   vertex_blender = R_x(+90°) @ vertex_gltf_authored
+# This is the only vertex-level transform Blender bakes; any root-node TRS
+# (nodes[0].rotation = R_baked in the glTF JSON) is stored as the object's
+# matrix_local and is NOT baked into vertex positions.
 #
-# Some GLB files have an additional rotation baked into the root node transform
-# (visible in the glTF JSON as nodes[0].rotation).  Blender's GLTF importer
-# sets matrix_world = baked_node_rotation, but our pipeline overwrites
-# matrix_world entirely, so the baked rotation is silently discarded.
-# To restore it we must compose it INTO the correction:
+# When our pipeline overrides matrix_world = T_WO @ R_corr, Blender discards
+# the stored matrix_local (i.e. R_baked is lost).  The vertices remain as
+# R_x(+90°) @ vertex_gltf_authored.
 #
-#   T_corrected = T_WO_adt @ R_x(-90°) @ R_baked
+# For vertex_world = T_WO @ vertex_canonical:
+#   T_WO @ R_corr @ R_x(+90°) @ vertex_gltf_authored = T_WO @ R_baked @ vertex_gltf_authored
+#   => R_corr = R_baked @ R_x(+90°)^{-1} = R_baked @ R_x(-90°)
 #
-# Derivation:
-#   We want: vertex_world = T_WO_adt @ R_x(-90°) @ (R_baked @ vertex_prebaked)
-#   Blender applies: matrix_world @ vertex_prebaked
-#   ∴ matrix_world = T_WO_adt @ R_x(-90°) @ R_baked
+# For objects with no baked root rotation, R_baked = I → R_corr = R_x(-90°).
+# For WhiteFlatwareTray (R_baked ≈ R_y(+90°)):
+#   R_corr = R_y(+90°) @ R_x(-90°)
+#   → tray lies flat with long axis along world +Z (front direction) ✓
 #
-# For objects without a baked rotation R_baked = I → same as before.
-#
-# NOTE (diagnostic finding): Blender's glTF importer bakes any root-node
-# rotation into vertex positions during import.  So after import_scene.gltf,
-# the mesh vertices are already in "post-baked" space and only R_x(-90°) is
-# needed — no additional R_baked term.  Applying R_baked again would
-# double-rotate objects with a baked root-node TRS (verified on
-# WhiteFlatwareTray.glb which has R_y(90°) baked in nodes[0].rotation).
+# Verified by diagnostic on frame 0: comparing projected tray footprint
+# against GT segmentation confirms R_baked @ R_x(-90°) matches ADT synthetic.
 
 R_x_neg90 = np.array([[1, 0,  0],
                        [0, 0,  1],
                        [0,-1,  0]], dtype=float)
 
+# Cache of glb_path → baked 3×3 rotation matrix read from GLB JSON chunk.
+_glb_baked_rotation_cache: dict = {}
+
+def _read_glb_baked_rotation(glb_path: str) -> np.ndarray:
+    """Return the root node's baked rotation as a 3×3 matrix (identity if none).
+
+    glTF stores the root node's local transform in the JSON chunk.
+    'rotation' field is a quaternion [x, y, z, w].
+    """
+    if glb_path in _glb_baked_rotation_cache:
+        return _glb_baked_rotation_cache[glb_path]
+    R = np.eye(3)
+    try:
+        import struct as _struct
+        with open(glb_path, 'rb') as f:
+            f.read(12)
+            chunk_len = _struct.unpack('<I', f.read(4))[0]
+            f.read(4)
+            gltf = json.loads(f.read(chunk_len))
+        nodes = gltf.get('nodes', [])
+        if nodes and 'rotation' in nodes[0]:
+            q = nodes[0]['rotation']          # [x, y, z, w]
+            R = Rotation.from_quat(q).as_matrix()
+    except Exception:
+        pass
+    _glb_baked_rotation_cache[glb_path] = R
+    return R
+
+
 def correct_object_rotation(T_WO, glb_path: str | None = None):
-    """Post-multiply rotation by R_x(-90°) to produce the correct world matrix
-    for a GLB object.
+    """Return corrected 4×4 world matrix for a GLB object.
 
-    Blender's glTF importer bakes any root-node rotation from the GLB's JSON
-    chunk directly into vertex positions during import.  When we override
-    matrix_world after import, the vertices are therefore already in the
-    "post-baked" local space.  Applying R_baked a second time would
-    double-rotate the object.  Consequently, we need only R_x(-90°) regardless
-    of whether the GLB has a baked root-node rotation or not.
+    Applies T_WO @ R_baked @ R_x(-90°):
+      - R_x(-90°) undoes Blender's gltf→native vertex coord conversion.
+      - R_baked re-applies the root-node authored→canonical rotation that
+        Blender's importer stored as matrix_local (lost when we override
+        matrix_world).
+      - T_WO places the canonical frame in ADT world space.
 
-    R_x(-90°) maps the object's local +Z → world +Y (up in ADT Y-up).  This is
-    the ADT object convention: T_WO represents the object pose assuming its
-    canonical "standing axis" is +Z; R_x(-90°) re-orients that to world +Y.
+    For objects without a baked root-node rotation (R_baked = I) this
+    reduces to T_WO @ R_x(-90°).
 
     Args:
         T_WO:     4×4 ADT world-from-object transform (numpy).
-        glb_path: Retained for API compatibility; no longer used.
+        glb_path: Path to the .glb file to read R_baked from its JSON chunk.
 
     Returns corrected 4×4 matrix ready to pass as Blender matrix_world.
     """
+    R_baked = _read_glb_baked_rotation(glb_path) if glb_path else np.eye(3)
     T_c = T_WO.copy()
-    T_c[:3, :3] = T_WO[:3, :3] @ R_x_neg90
+    T_c[:3, :3] = T_WO[:3, :3] @ R_baked @ R_x_neg90
     return T_c
 
 
