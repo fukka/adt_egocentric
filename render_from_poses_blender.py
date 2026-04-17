@@ -418,6 +418,162 @@ def build_object_list(instances, obj_poses, models_dir):
     return result
 
 
+# ── Aria Gen1 colour pipeline ──────────────────────────────────────────────
+# Source: projectaria_tools/core/image/utility/ColorCorrectData.h
+# cameraInvCRFTableGen1: maps camera pixel index (0..255) → linear float.
+# Used here in the FORWARD direction (linear → camera pixel) by inverting the LUT.
+_ARIA_INV_CRF = np.array([
+    0.0, 0.0005489583158375797, 0.0011304615925053726, 0.0017206098925041386,
+    0.002319584122130247, 0.0029275651876800664, 0.0035447339954499655, 0.004171271451736312,
+    0.004807358462835479, 0.005453175935043828, 0.006108904774657734, 0.006774725887973564,
+    0.007450820181287686, 0.008137368560896467, 0.00883455193309628, 0.009542551204183491,
+    0.010261547280454473, 0.010991721068205586, 0.011733253473733206, 0.012486325403333701,
+    0.013251117763303443, 0.01402781145993879, 0.01481658739953612, 0.015617626488391797,
+    0.016431109632802192, 0.017257217739063677, 0.018096131713472616, 0.01894803246232538,
+    0.019813100891918338, 0.020691517908547855, 0.0215834644185103, 0.02248912132810205,
+    0.023408669543619462, 0.024342289971358917, 0.025290163517616784, 0.026252471088689406,
+    0.027229393590873188, 0.02822111193046447, 0.029227807013759644, 0.030249659747055072,
+    0.031286851036647106, 0.03233956178883213, 0.03340797290990651, 0.03449226530616662,
+    0.03559261988390881, 0.036709217549429476, 0.03784223920902497, 0.03899186576899166,
+    0.040158278135625926, 0.04134165721522412, 0.04254218391408263, 0.04376003913849781,
+    0.04499540379476604, 0.046248458789183676, 0.0475193850280471, 0.04880836341765266,
+    0.050115574864296755, 0.05144120027427573, 0.05278542055388596, 0.05414841660942382,
+    0.055530369347185686, 0.05693145967346789, 0.05835186849456683, 0.05979177671677889,
+    0.06125134402733013, 0.0627306452371655, 0.06422973393815963, 0.06574866372218725,
+    0.06728748818112294, 0.06884626090684144, 0.07042503549121736, 0.07202386552612536,
+    0.07364280460344011, 0.07528190631503627, 0.0769412242527885, 0.07862081200857149,
+    0.08032072317425984, 0.08204101134172825, 0.08378173010285139, 0.0855429330495039,
+    0.08732467377356042, 0.08912700586689566, 0.09094998292138422, 0.09279365852890081,
+    0.09465808628132008, 0.09654331977051668, 0.09844941258836529, 0.10037641832674053,
+    0.10232439057751708, 0.10429338293256958, 0.10628344898377279, 0.10829464232300128,
+    0.11032701654212967, 0.11238062523303273, 0.11445552198758502, 0.11655176039766128,
+    0.11866939405513612, 0.1208084765518842, 0.12296906147978025, 0.12515120243069883,
+    0.12735495299651467, 0.1295803667691024, 0.13182749734033666, 0.13409639830209213,
+    0.13638712324624355, 0.13869972576466547, 0.14103425944923256, 0.14339077789181956,
+    0.14576933468430103, 0.14816998341855173, 0.15059277768644622, 0.15303777107985925,
+    0.1555050171906654, 0.15799456961073938, 0.16050648193195585, 0.16304080774618943,
+    0.16559760064531487, 0.16817691422120676, 0.17077880206573973, 0.17340331777078852,
+    0.1760505149282277, 0.17872044712993204, 0.1814131679677761, 0.18412873103363459,
+    0.18686718991938217, 0.18962859821689348, 0.19241322376272835, 0.19522219137218724,
+    0.19805684010525568, 0.20091850902191935, 0.20380853718216377, 0.20672826364597457,
+    0.2096790274733374, 0.21266216772423774, 0.21567902345866122, 0.21873093373659347,
+    0.22181923761802008, 0.2249452741629267, 0.22811038243129877, 0.231315901483122,
+    0.234563170378382, 0.2378535281770643, 0.2411883139391545, 0.2445688667246383,
+    0.2479965255935011, 0.25147262960572864, 0.2549985178213065, 0.25857552930022026,
+    0.2622050031024555, 0.26588827828799777, 0.2696266939168328, 0.2734215890489461,
+    0.27727430274432324, 0.2811861740629498, 0.2851585420648115, 0.28919274580989385,
+    0.29329012435818236, 0.2974520167696628, 0.30167954500568883, 0.30597296263308676,
+    0.31033230612005097, 0.314757611934776, 0.31924891654545634, 0.3238062564202863,
+    0.32842966802746065, 0.3331191878351734, 0.33787485231161934, 0.34269669792499285,
+    0.3475847611434884, 0.35253907843530036, 0.35755968626862317, 0.36264662111165136,
+    0.3677999194325794, 0.3730196176996018, 0.3783057523809129, 0.38365835994470704,
+    0.3890774768591791, 0.3945631395925231, 0.4001153846129337, 0.4057342483886053,
+    0.4114197673877324, 0.4171719780785095, 0.42299091692913093, 0.4288766204077912,
+    0.4348291249826848, 0.44084846712200615, 0.44693468329394964, 0.4530878099667099,
+    0.45930788360848124, 0.4655948393826846, 0.47194820723364705, 0.4783674158009217,
+    0.48485189372406234, 0.49140106964262215, 0.49801437219615463, 0.5046912300242129,
+    0.5114310717663507, 0.5182333260621212, 0.5250974215510781, 0.5320227868727746,
+    0.5390088506667641, 0.5460550415725999, 0.5531607882298355, 0.5603255192780244,
+    0.5675486633567199, 0.5748296491054756, 0.5821679051638445, 0.5895628601713804,
+    0.5970139427676364, 0.6045205815921662, 0.612082205284523, 0.6196982424842601,
+    0.6273681218309314, 0.6350912719640895, 0.6428671215232885, 0.6506950991480817,
+    0.6585746334780221, 0.6665051531526636, 0.6744860868115592, 0.6825168630942625,
+    0.6905969106403269, 0.6987256580893058, 0.7069025340807524, 0.7151269672542204,
+    0.7233983862492631, 0.7317162197054341, 0.7400798962622864, 0.7484888445593735,
+    0.7569424932362492, 0.7654402709324662, 0.7739816062875785, 0.7825659279411395,
+    0.7911926645327022, 0.7998612447018203, 0.8085710970880473, 0.817321650330936,
+    0.8261123330700405, 0.8349425739449137, 0.8438118015951095, 0.852719444660181,
+    0.8616649317796815, 0.8706476915931647, 0.8796671527401837, 0.8887227438602919,
+    0.897813893593043, 0.9069400305779904, 0.9161005834546873, 0.9252949808626869,
+    0.9345226514415432, 0.943783023830809, 0.9530755266700381, 0.962399588598784,
+    0.9717546382565994, 0.9811401042830384, 0.9905554153176543, 1.0
+], dtype=np.float32)
+
+# colorCorrectionMatrixDataGen1: converts camera linear RGB → standard linear RGB.
+# Rows = [R, G, B] output; columns = [R, G, B] input (row-major, 3×3).
+_ARIA_CCM = np.array([
+    [0.7436561584472656,  0.15223266184329987, -0.012550695799291134],
+    [0.02287297323346138, 0.8269245028495789,  -0.004977707751095295],
+    [-0.02940891683101654, -0.08261162042617798, 0.5401387810707092 ],
+], dtype=np.float32)
+
+# Inverse CCM: standard linear RGB → camera linear RGB
+_ARIA_CCM_INV = np.linalg.inv(_ARIA_CCM).astype(np.float32)
+
+# Pixel index axis for LUT interpolation (256 values mapping to [0, 1])
+_ARIA_INV_CRF_X = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+
+
+# Scene-level colour balance correction calibrated to ADT Apartment sequence.
+# Compensates for the residual per-channel mismatch between Blender Cycles
+# (with warm ceiling lights) and Omniverse (ADT synthetic reference), AFTER
+# the Aria Gen1 forward ISP has been applied.
+# Calibrated from frame 0: target = ADT synthetic means (R=60.4, G=52.7, B=48.3)
+# vs Blender Standard+ISP at EV=-0.8 (R=65.3, G=48.6, B=54.7).
+# Scales: R=60.4/65.3=0.925, G=52.7/48.6=1.085, B=48.3/54.7=0.883
+CHANNEL_BALANCE_ADT_APARTMENT = np.array([0.925, 1.085, 0.883], dtype=np.float32)
+
+
+def apply_aria_forward_isp(srgb_img: np.ndarray,
+                           channel_balance: np.ndarray | None = CHANNEL_BALANCE_ADT_APARTMENT
+                           ) -> np.ndarray:
+    """Convert a Standard-sRGB uint8 image to Aria Gen1 camera ISP colour space.
+
+    ADT synthetic images are rendered with NVIDIA Omniverse + Aria ISP simulation,
+    making them look like raw Aria camera output.  To match that colour space our
+    Blender renders (rendered with Standard / sRGB colour management) must be passed
+    through the same forward ISP:
+
+      sRGB uint8
+        → linear float  (inverse sRGB gamma, piecewise power γ=2.4)
+        → camera linear  (inverse CCM: standard linear → sensor primaries)
+        → camera pixel   (forward CRF: inverts the cameraInvCRFTableGen1 LUT)
+        → optional per-channel balance scale  (corrects Blender-vs-Omniverse tint)
+        → uint8 output   (Aria ISP colour space, matches ADT synthetic images)
+
+    Args:
+        srgb_img:        H×W×3 uint8 array in Standard sRGB colour space.
+        channel_balance: Optional length-3 array of per-channel multipliers applied
+                         after the ISP, in camera pixel space.  Compensates for the
+                         residual tint from Blender's warm ceiling lights vs the ADT
+                         Omniverse reference.  Pass None to disable.
+                         Default: CHANNEL_BALANCE_ADT_APARTMENT (calibrated on
+                         Apartment_release_golden_skeleton_seq100_10s_sample_M1292).
+
+    Returns:
+        H×W×3 uint8 array in Aria Gen1 camera ISP colour space.
+    """
+    # Step 1: sRGB → linear (inverse sRGB gamma)
+    v = srgb_img.astype(np.float32) / 255.0
+    linear = np.where(v <= 0.04045,
+                      v / 12.92,
+                      ((v + 0.055) / 1.055) ** 2.4)
+
+    # Step 2: standard linear → camera linear (inverse CCM)
+    H, W, _ = linear.shape
+    cam_lin = (linear.reshape(-1, 3) @ _ARIA_CCM_INV.T).reshape(H, W, 3)
+    cam_lin = np.clip(cam_lin, 0.0, 1.0)
+
+    # Step 3: camera linear → camera pixel value (forward CRF)
+    # _ARIA_INV_CRF maps pixel-index-fraction → linear; we invert via np.interp.
+    # For each channel: pixel_fraction = interp(cam_lin_value, inv_crf_vals, x_axis)
+    out = np.empty_like(cam_lin)
+    for c in range(3):
+        out[..., c] = np.interp(cam_lin[..., c], _ARIA_INV_CRF, _ARIA_INV_CRF_X)
+
+    out_uint8 = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+
+    # Step 4 (optional): scene-level channel balance correction
+    if channel_balance is not None:
+        cb = np.asarray(channel_balance, dtype=np.float32)
+        out_uint8 = np.clip(
+            out_uint8.astype(np.float32) * cb[np.newaxis, np.newaxis, :],
+            0, 255
+        ).astype(np.uint8)
+
+    return out_uint8
+
+
 def colorize_seg(seg_uid):
     """Map instance UIDs to stable RGB colours (hash-based) for visualisation."""
     import hashlib
@@ -610,13 +766,18 @@ def main():
             eq_img   = Image.open(blender_out)
             map_x, map_y, valid = fisheye_remap
             fish_arr = remap_equirect_to_fisheye(eq_img, map_x, map_y, valid)
+            # Apply Aria Gen1 forward ISP so colours match ADT synthetic images
+            fish_arr = apply_aria_forward_isp(fish_arr)
             Image.fromarray(fish_arr).save(out_png)
             # Also save full fisheye copy in dedicated folder
             Image.fromarray(fish_arr).save(
                 f'{args.output_dir}/fisheye/frame_{idx:04d}.png')
             render_img = fish_arr
         else:
-            render_img = np.array(Image.open(out_png).convert('RGB'))
+            raw_render = np.array(Image.open(out_png).convert('RGB'))
+            # Apply Aria Gen1 forward ISP so colours match ADT synthetic images
+            render_img = apply_aria_forward_isp(raw_render)
+            Image.fromarray(render_img).save(out_png)
 
         # ── Segmentation post-processing ────────────────────────────────────
         if os.path.exists(seg_exr_tmp):

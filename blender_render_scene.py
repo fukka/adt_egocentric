@@ -113,9 +113,15 @@ else:
     light.shadow_soft_size = 1.0
 
 # ── Colour management ─────────────────────────────────────────────────────
-scene.view_settings.view_transform = 'Filmic'
-scene.view_settings.look            = 'Medium Low Contrast'
-scene.view_settings.exposure        = -0.3
+# Use Standard (sRGB) output so render_from_poses_blender.py can apply the
+# Aria Gen1 forward ISP in post-processing, matching ADT synthetic colour space.
+# Filmic would bake a different tone-curve that fights the subsequent ISP transform.
+# Exposure = -0.8 EV compensates for Standard mode being ~0.8 stops brighter than
+# Filmic for this scene; the ISP and optional channel_balance correction in the
+# driver script fine-tune the remaining per-channel mismatch vs ADT synthetic.
+scene.view_settings.view_transform = 'Standard'
+scene.view_settings.look            = 'None'
+scene.view_settings.exposure        = -0.8
 scene.view_settings.gamma           =  1.0
 
 # ── Import GLB objects at world poses ─────────────────────────────────────
