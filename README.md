@@ -12,10 +12,14 @@ ADT real RGB frame     → SAM 2.1 Large    → instance masks  → IoU vs GT se
 ## Features
 
 - Reads **6-DoF object poses** (`scene_objects.csv`) and **camera trajectory** (`aria_trajectory.csv`) directly from ADT ground truth
+- Supports both **static** (`motion_type: static`) and **dynamic** (`motion_type: dynamic`) objects — dynamic objects use timestamp-resolved poses from per-object dynamic CSVs
 - Imports **400+ DTC GLB object models** and places them at their correct world poses
 - Renders via **Blender 3.6 Cycles** (CPU or GPU) in equirectangular panoramic mode
 - Remaps the panorama to the exact **Aria FISHEYE624** projection using Newton-Raphson inversion of the Kannala-Brandt polynomial
-- Applies the **GLTF Y-up → ADT Z-up rotation fix** (`R_correct = R_adt @ R_x(−90°)`) so all objects render upright
+- Applies the correct **GLB → ADT rotation fix** (`R_correct = T_WO @ R_baked @ R_x(−90°)`) so all objects render upright and correctly oriented
+- Simulates **scene lighting** from ADT prop positions (19 point lights) plus 6 ceiling area lights
+- Applies the **Aria Gen1 ISP colour pipeline** (sRGB → linear → camera linear via inverse CCM → camera pixel space via forward CRF + per-channel balance)
+- Outputs **per-frame instance segmentation masks** (`.npy` int64 UIDs + colourised PNG)
 - Distance-culls to the nearest 80 objects to stay within memory limits
 - Caches the fisheye remap LUT (`.npz`) — computed once per output resolution, reused on subsequent runs
 - Evaluates **SAM 2.1 Large** zero-shot instance segmentation on real egocentric frames against ADT GT, reporting per-instance IoU
@@ -156,10 +160,11 @@ python render_from_poses_blender.py \
 
 ```
 {output_dir}/
-    rgb/           ← final renders (fisheye if --fisheye, else perspective)
-    fisheye/       ← (--fisheye only) fisheye-remapped frames
-    comparison/    ← side-by-side: real ego-RGB | Blender render
-    _remap_512.npz ← cached fisheye LUT (reused across runs)
+    rgb/              ← final renders (fisheye if --fisheye, else equirectangular)
+    fisheye/          ← (--fisheye only) fisheye-remapped frames
+    comparison/       ← side-by-side: real ego-RGB | Blender render
+    seg_masks/        ← per-frame instance segmentation (.npy int64 UIDs + colourised PNG)
+    _remap_512.npz    ← cached fisheye LUT (reused across runs)
 ```
 
 ### SAM 2 segmentation evaluation
@@ -213,22 +218,89 @@ T_WC_blender = T_WC_adt @ FLIP_YZ
 
 ### Object rotation fix
 
-ADT `T_WO` quaternions assume the canonical standing axis is local **+Z**. GLB models (glTF 2.0) have their standing axis as local **+Y**. Without correction every object renders tilted 90° on its side.
+GLB models require a two-part correction when placed at ADT world poses:
 
-Fix — post-multiply by `R_x(−90°)` for every object:
+**Background:** Blender's glTF importer applies a gltf→Blender-native coordinate conversion (`R_x(+90°)`) by **baking it directly into vertex positions**. It also stores the root node's authored→canonical rotation (`R_baked`, read from `nodes[0].rotation` in the GLB JSON chunk) as the object's `matrix_local`. When our pipeline overrides `matrix_world` directly, `matrix_local` is silently discarded, so `R_baked` must be re-applied manually.
+
+**Fix — post-multiply by `R_baked @ R_x(−90°)` for every object:**
 
 ```python
 R_x_neg90 = np.array([[1, 0,  0],
                        [0, 0,  1],
                        [0,-1,  0]])
 
-def correct_object_rotation(T_WO):
+def _read_glb_baked_rotation(glb_path):
+    """Read root node baked rotation quaternion from GLB JSON chunk."""
+    import struct, json
+    with open(glb_path, 'rb') as f:
+        f.read(12)
+        chunk_len = struct.unpack('<I', f.read(4))[0]
+        f.read(4)
+        gltf = json.loads(f.read(chunk_len))
+    nodes = gltf.get('nodes', [])
+    if nodes and 'rotation' in nodes[0]:
+        q = nodes[0]['rotation']   # [x, y, z, w] glTF convention
+        return Rotation.from_quat(q).as_matrix()
+    return np.eye(3)
+
+def correct_object_rotation(T_WO, glb_path=None):
+    R_baked = _read_glb_baked_rotation(glb_path) if glb_path else np.eye(3)
     T_c = T_WO.copy()
-    T_c[:3, :3] = T_WO[:3, :3] @ R_x_neg90
+    T_c[:3, :3] = T_WO[:3, :3] @ R_baked @ R_x_neg90
     return T_c
 ```
 
-Result: `R_correct[:,2] = R_adt[:,1]` — for an upright bowl, `R_adt[:,1] = [0,1,0]`, so the bowl opening faces world `+Y` ✓
+The multiplication order matters:
+- `R_x_neg90` undoes the vertex-level gltf coord conversion baked by Blender's importer.
+- `R_baked` (applied first, left-to-right in local frame) restores the authored→canonical mapping that was stored in `matrix_local` and lost when we override `matrix_world`.
+- For objects with no root rotation (`R_baked = I`), this reduces to `T_WO @ R_x_neg90`.
+
+### Dynamic object support
+
+ADT objects are classified as `motion_type: static` or `motion_type: dynamic` in `instances.json`. Static objects have a single pose in `scene_objects.csv`. Dynamic objects (e.g. objects handled by the subject) have per-frame poses in `instances/<uid>/<uid>_<sequence_name>.csv`, resolved by nearest-timestamp lookup.
+
+```python
+# Pose resolution for dynamic objects
+ts_col = dynamic_df['timestamp[ns]'].values.astype(np.int64)
+idx = np.argmin(np.abs(ts_col - frame_timestamp_ns))
+T_WO = dynamic_df.iloc[idx][['tx_world_object', ...]]
+```
+
+### Aria Gen1 ISP colour pipeline
+
+To match the appearance of real Aria RGB frames, Blender renders (sRGB output) are converted through a forward approximation of the Aria Gen1 ISP:
+
+```
+sRGB → linear (gamma 2.2) → camera linear (× inv_CCM) → camera pixel (forward CRF) → channel balance
+```
+
+Key constants for the ADT Apartment sequence:
+
+```python
+CHANNEL_BALANCE_ADT_APARTMENT = np.array([0.925, 1.085, 0.883])  # R, G, B
+
+ARIA_CCM = np.array([[ 1.7042, -0.4964, -0.2078],
+                     [-0.3498,  1.5008, -0.1510],
+                     [-0.0569, -0.5651,  1.6220]])
+```
+
+### Scene lighting
+
+Lights are placed in ADT world space based on prop positions from `instances.json`:
+
+- **Point lights**: 19 props tagged as light sources, placed at their ADT world positions (power ≈ 100 W each).
+- **Ceiling area lights**: 6 large area lights (3 m × 3 m, 200 W each) distributed across the ceiling plane to simulate ambient fill.
+
+### Blender colour management
+
+```python
+scene.view_settings.view_transform = 'Standard'   # not Filmic — avoids tone-mapping
+scene.view_settings.exposure = -0.8               # compensate for Cycles HDR headroom
+scene.view_settings.look = 'None'
+scene.view_settings.gamma = 1.0
+```
+
+`Standard` mode is used (not Filmic) so that the rendered sRGB output can be passed through the Aria ISP pipeline without double tone-mapping.
 
 ### FISHEYE624 remap
 
@@ -253,8 +325,8 @@ SAM 2.1 Large requires significant RAM. On machines with limited memory (~4 GB):
 
 | File | Description |
 |---|---|
-| `render_from_poses_blender.py` | Driver script — reads ADT CSVs, exports per-frame JSON, calls Blender, applies fisheye remap |
-| `blender_render_scene.py` | Blender headless script — imports GLB objects, sets camera pose, renders Cycles |
+| `render_from_poses_blender.py` | Driver script — reads ADT CSVs, exports per-frame JSON, calls Blender, applies fisheye remap + Aria ISP |
+| `blender_render_scene.py` | Blender headless script — imports GLB objects, sets camera pose, renders Cycles, outputs segmentation EXR |
 | `render_from_poses.py` | Lightweight CPU pose renderer (no Blender dependency) |
 | `rectify_pipeline.py` | Equirectangular → FISHEYE624 remap via Newton-Raphson LUT |
 | `run_sam2.py` | SAM 2.1 Large automatic mask generation + IoU evaluation against ADT GT |
