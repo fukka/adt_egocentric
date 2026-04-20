@@ -349,8 +349,9 @@ def render_camera(cam_name, cam_cfg, frame_ts_ns, all_objects, scene_lights,
             pass_idx_to_uid[i + 1] = 0
         visible_objects[i] = obj
 
-    # Focal length for standard wide-angle: VFOV ≈ 70° → f = (H/2) / tan(35°)
-    focal_px = (args.output_size / 2.0) / np.tan(np.radians(35.0))
+    # Focal length from VFOV: f = (H/2) / tan(VFOV/2).  Default 70°; overridable via --fov.
+    fov_deg  = cam_cfg.get('fov_deg', 70.0)
+    focal_px = (args.output_size / 2.0) / np.tan(np.radians(fov_deg / 2.0))
 
     frame_data = {
         'image_width':    args.output_size,
@@ -426,8 +427,39 @@ def main():
                         default=f'{BASE}/exocentric_rendered')
     parser.add_argument('--no_segmentation', action='store_true',
                         help='Skip instance segmentation output')
+
+    # ── Manual camera-pose overrides ──────────────────────────────────────
+    # These let you tweak the pose from the command line without editing the
+    # source.  They apply to the single camera selected by --camera (not 'all').
+    #
+    # Example — nudge eye position and field of view:
+    #   python render_exocentric_blender.py \
+    #       --camera right_back \
+    #       --eye -2.5 1.8 1.7 \
+    #       --target 2.55 1.5 1.7 \
+    #       --fov 60
+    pose_grp = parser.add_argument_group(
+        'manual pose overrides',
+        'Override the hard-coded pose for the selected camera. '
+        'Omit any flag to keep the preset value.')
+    pose_grp.add_argument('--eye',    type=float, nargs=3, metavar=('X', 'Y', 'Z'),
+                          default=None,
+                          help='Camera eye position in ADT world coords (Y-up metres)')
+    pose_grp.add_argument('--target', type=float, nargs=3, metavar=('X', 'Y', 'Z'),
+                          default=None,
+                          help='Look-at target point in ADT world coords')
+    pose_grp.add_argument('--fov',    type=float, default=None,
+                          metavar='DEGREES',
+                          help='Vertical field of view in degrees (default: 70°)')
+
     args = parser.parse_args()
     args.segmentation = not args.no_segmentation
+
+    # Validate: manual overrides only make sense for a single camera
+    has_override = args.eye is not None or args.target is not None or args.fov is not None
+    if has_override and args.camera == 'all':
+        parser.error('--eye / --target / --fov cannot be combined with --camera all. '
+                     'Choose a specific camera name.')
 
     os.makedirs(args.output_dir, exist_ok=True)
     tmp_dir = f'{args.output_dir}/_tmp'
@@ -467,10 +499,32 @@ def main():
     else:
         selected = [(args.camera, EXOCENTRIC_CAMERAS[args.camera])]
 
+    # Apply manual pose overrides (single-camera mode only)
+    if has_override:
+        cam_name, cam_cfg = selected[0]
+        cam_cfg = dict(cam_cfg)   # shallow copy so we don't mutate the global dict
+        if args.eye is not None:
+            cam_cfg['eye'] = np.array(args.eye)
+        if args.target is not None:
+            cam_cfg['target'] = np.array(args.target)
+        if args.fov is not None:
+            cam_cfg['fov_deg'] = float(args.fov)
+        cam_cfg['desc'] += ' [manually overridden]'
+        selected = [(cam_name, cam_cfg)]
+
     print(f'\nRendering {len(selected)} camera(s)...')
     for cam_name, cam_cfg in selected:
         print(f'\nCamera: {cam_name}')
         print(f'  {cam_cfg["desc"]}')
+        eye = cam_cfg['eye']; tgt = cam_cfg['target']
+        dist = float(np.linalg.norm(tgt - eye))
+        fwd  = (tgt - eye) / dist
+        pitch = np.degrees(np.arcsin(-fwd[1]))
+        print(f'  eye=({eye[0]:.3f}, {eye[1]:.3f}, {eye[2]:.3f})  '
+              f'target=({tgt[0]:.3f}, {tgt[1]:.3f}, {tgt[2]:.3f})  '
+              f'dist={dist:.2f}m  pitch={pitch:.1f}°')
+        if 'fov_deg' in cam_cfg:
+            print(f'  fov={cam_cfg["fov_deg"]:.1f}°  (overridden)')
         render_camera(cam_name, cam_cfg, frame_ts_ns, all_objects,
                       scene_lights, args, tmp_dir)
 
