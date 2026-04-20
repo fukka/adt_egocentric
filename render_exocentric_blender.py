@@ -105,17 +105,19 @@ def lookat_adt(eye, target, world_up=None):
 # All look toward the kitchen counter area (approx. where the ego camera is
 # focused at frame 0).  Pre-computed with lookat_adt; stored as flat 4×4 lists.
 
-_SCENE_TARGET = np.array([1.0, 0.9, 1.5])   # kitchen counter look-at point
+_SCENE_TARGET  = np.array([1.0, 0.9, 1.5])    # kitchen counter (used by left_side / overhead)
+_CABINET_TARGET = np.array([2.55, 1.5, 1.7])  # centre of cabinet face visible to ego cam
 
 EXOCENTRIC_CAMERAS = {
-    # Far end of the room, at eye/cabinet height, looking across toward the kitchen.
-    # Z=7.5 is near the far +Z wall (room spans Z≈-4 to +9); Y=1.8 m is standing
-    # eye height / top-of-cabinet height.  Pitch only 8.5° down — realistic POV,
-    # similar to a person standing at the back wall watching someone at the counter.
+    # Opposite side of the kitchen from the cabinet wall, at eye height, looking
+    # straight in the +X direction.  Cabinets run X≈2.55; the ego camera was
+    # looking at the Z≈1.3–2.2 section.  Camera Z=1.7 aligns with that section
+    # and avoids the kitchen island (Z=2.44) being squarely in the path.
+    # Pitch ≈ 4° down — nearly horizontal, realistic standing POV.
     'right_back': {
-        'eye':    np.array([0.5, 1.8, 7.5]),
-        'target': _SCENE_TARGET,
-        'desc':   'Far end of room at eye height (≈8.5° pitch, 6.1 m from target)',
+        'eye':    np.array([-2.0, 1.8, 1.7]),
+        'target': _CABINET_TARGET,
+        'desc':   'Kitchen side, head-on view of cabinet wall (≈4° pitch, 4.6 m away)',
     },
     # Side view from the left, ~2.8 m elevation, ~31° down-pitch.
     # Perpendicular to the ego camera's viewing direction; shows counter depth.
