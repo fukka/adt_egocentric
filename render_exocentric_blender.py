@@ -108,13 +108,14 @@ def lookat_adt(eye, target, world_up=None):
 _SCENE_TARGET = np.array([1.0, 0.9, 1.5])   # kitchen counter look-at point
 
 EXOCENTRIC_CAMERAS = {
-    # Diagonal view from the rear-right corner, ~4.3 m elevation, ~27° down-pitch.
-    # Pushed back to 7.6 m from the target so the full kitchen area fits the frame
-    # without the cabinet wall dominating the view.
+    # Far end of the room, at eye/cabinet height, looking across toward the kitchen.
+    # Z=7.5 is near the far +Z wall (room spans Z≈-4 to +9); Y=1.8 m is standing
+    # eye height / top-of-cabinet height.  Pitch only 8.5° down — realistic POV,
+    # similar to a person standing at the back wall watching someone at the counter.
     'right_back': {
-        'eye':    np.array([6.0, 4.3, 6.0]),
+        'eye':    np.array([0.5, 1.8, 7.5]),
         'target': _SCENE_TARGET,
-        'desc':   'Elevated diagonal from rear-right corner (≈27° pitch, 7.6 m from target)',
+        'desc':   'Far end of room at eye height (≈8.5° pitch, 6.1 m from target)',
     },
     # Side view from the left, ~2.8 m elevation, ~31° down-pitch.
     # Perpendicular to the ego camera's viewing direction; shows counter depth.
