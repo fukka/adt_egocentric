@@ -226,6 +226,18 @@ def load_scene(frame_idx=0):
     for cx, cz in [(0.5,2.5),(0.5,0.5),(-1.0,-1.5),(-1.0,4.5),(-2.5,-2.5),(-2.5,1.5)]:
         lights.append({'type':'AREA','location':[cx,CEIL_Y,cz],
                        'energy':CEIL_E,'color':CEIL_C,'size':CEIL_S})
+    # Dedicated point light above the WoodenBowl (dynamic object, frame-resolved)
+    WOODEN_BOWL_UID = '4508463855879675'
+    bowl_T = resolved_dyn.get(WOODEN_BOWL_UID) or static_poses.get(WOODEN_BOWL_UID)
+    if bowl_T is not None:
+        bx, by, bz = float(bowl_T[0, 3]), float(bowl_T[1, 3]), float(bowl_T[2, 3])
+        lights.append({
+            'type':     'POINT',
+            'location': [bx, by + 0.30, bz],
+            'energy':   80.0,
+            'color':    [1.0, 0.90, 0.75],
+            'radius':   0.08,
+        })
 
     return all_objects, lights
 

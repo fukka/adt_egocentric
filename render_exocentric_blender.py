@@ -250,8 +250,14 @@ def build_object_list(instances, obj_poses, models_dir):
     return result
 
 
-def build_scene_lights(scene_objects_csv, instances_json_path):
-    """(Same as render_from_poses_blender.py — prop point lights + ceiling area lights.)"""
+def build_scene_lights(scene_objects_csv, instances_json_path, bowl_pos=None):
+    """Prop point lights + ceiling area lights.
+
+    Args:
+        bowl_pos: Optional (x, y, z) position of the WoodenBowl (from dynamic
+                  poses at the current frame).  When provided, a dedicated warm
+                  point light is placed 0.30 m above it to highlight the bowl.
+    """
     LIGHT_PROPS = {
         'Lamp_1':        {'energy': 120.0, 'color': [1.0, 0.82, 0.60], 'radius': 0.15},
         'WhitTableLamp': {'energy':  80.0, 'color': [1.0, 0.85, 0.65], 'radius': 0.12},
@@ -260,8 +266,6 @@ def build_scene_lights(scene_objects_csv, instances_json_path):
     }
     with open(instances_json_path) as f:
         instances_data = json.load(f)
-    name_to_uid = {v.get('prototype_name', ''): str(v['instance_id'])
-                   for v in instances_data.values()}
     lights = []
     with open(scene_objects_csv) as f:
         for row in csv.DictReader(f):
@@ -292,6 +296,17 @@ def build_scene_lights(scene_objects_csv, instances_json_path):
                      (-1.0, 4.5), (-2.5, -2.5), (-2.5, 1.5)]:
         lights.append({'type': 'AREA', 'location': [cx, CEIL_Y, cz],
                        'energy': CEIL_ENERGY, 'color': CEIL_COLOR, 'size': CEIL_SIZE})
+    # Dedicated point light above the WoodenBowl (dynamic — passed in by caller)
+    if bowl_pos is not None:
+        bx, by, bz = float(bowl_pos[0]), float(bowl_pos[1]), float(bowl_pos[2])
+        lights.append({
+            'type':     'POINT',
+            'location': [bx, by + 0.30, bz],
+            'energy':   80.0,
+            'color':    [1.0, 0.90, 0.75],
+            'radius':   0.08,
+        })
+        print(f'  Bowl light at ({bx:.3f}, {by + 0.30:.3f}, {bz:.3f})')
     return lights
 
 
@@ -489,9 +504,17 @@ def main():
     all_objects     = static_obj_list + dyn_obj_list
     print(f'  Static: {len(static_obj_list)}  Dynamic (at frame): {len(dyn_obj_list)}')
 
+    # Locate WoodenBowl for the dedicated overhead light (it is a dynamic object)
+    WOODEN_BOWL_UID = '4508463855879675'
+    bowl_T   = dyn_poses_frame.get(WOODEN_BOWL_UID) or static_poses.get(WOODEN_BOWL_UID)
+    bowl_pos = bowl_T[:3, 3] if bowl_T is not None else None
+    if bowl_pos is None:
+        print('  Warning: WoodenBowl not found — bowl light skipped.')
+
     print('Building scene lights...')
     scene_lights = build_scene_lights(f'{GT_DIR}/scene_objects.csv',
-                                      f'{GT_DIR}/instances.json')
+                                      f'{GT_DIR}/instances.json',
+                                      bowl_pos=bowl_pos)
 
     # Select cameras to render
     if args.camera == 'all':
