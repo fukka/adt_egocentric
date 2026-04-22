@@ -3,6 +3,8 @@ Blender rendering script — run with:
   blender --background --python blender_render_scene.py -- \
       --frame_data /path/to/frame_data.json --output /path/to/out.png \
       [--seg_output /path/to/seg.exr]
+      [--normal_output /path/to/normal.exr]
+      [--depth_output /path/to/depth.exr]
 
 Reads a JSON describing:
   - object_models: [{glb_path, T_WO (4x4 flat list), pass_index (int)}]
@@ -14,9 +16,20 @@ Reads a JSON describing:
 Segmentation output (--seg_output):
   Each object_model entry carries a pass_index (1-based int).  Blender's
   Object-Index render pass stores that value per pixel.  The compositor
-  writes it to an EXR (float32 BW) at --seg_output so the driver can
+  writes it to an EXR (float32 RGB) at --seg_output so the driver can
   remap pass_index → instance_uid using the pass_idx_to_uid table in the
   JSON.
+
+Normal output (--normal_output):
+  World-space surface normals written as float32 RGB EXR.
+  R = X, G = Y, B = Z components in ADT world space, values in [-1, 1].
+  Read with cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR; note BGR channel order
+  from OpenCV means B=Z, G=Y, R=X — flip channels to get (X,Y,Z).
+
+Depth output (--depth_output):
+  Camera-space distance (Z pass) written as float32 RGB EXR (depth value
+  broadcast to R=G=B).  Read R channel for the depth float.
+  Background pixels have very large values (~1e10); clip when visualising.
 """
 
 import bpy, sys, os, json, math, mathutils, glob
@@ -48,6 +61,12 @@ parser.add_argument('--frame_data', required=True)
 parser.add_argument('--output',     required=True)
 parser.add_argument('--seg_output', default=None,
                     help='Optional EXR path for per-pixel instance segmentation')
+parser.add_argument('--normal_output', default=None,
+                    help='Optional EXR path for per-pixel world-space surface normals '
+                         '(float32 RGB; R=X G=Y B=Z in ADT world coords, range [-1,1])')
+parser.add_argument('--depth_output', default=None,
+                    help='Optional EXR path for per-pixel camera-space depth distance '
+                         '(float32 RGB broadcast; read R channel for metres)')
 args = parser.parse_args(user_args)
 
 with open(args.frame_data) as f:
@@ -172,52 +191,55 @@ for img in bpy.data.images:
         except Exception:
             pass
 
-# ── Compositor: segmentation Object-Index pass ────────────────────────────
-# Only activated when --seg_output is given.
+# ── Compositor: segmentation, normal, and depth passes ────────────────────
 #
-# Problem with single-ViewLayer approach:
-#   Cycles treats transparent/glass materials (blend_method BLEND or HASHED)
-#   as partially transparent per-ray. The IndexOB pass honours this: transparent
-#   pixels "miss" the glass surface and record whatever is behind it (or 0 for
-#   background). With HASHED sampling this produces a dotted pattern because
-#   some rays hit the glass and some don't, depending on the dithering seed.
+# Activated when any of --seg_output / --normal_output / --depth_output are given.
 #
-# Fix — two ViewLayers in one render call:
+# ViewLayer design:
 #   Main  : normal materials, glass transparent → drives RGB write_still output
-#   Seg   : material_override = fully opaque diffuse → all surfaces solid →
-#           IndexOB correctly records every glass/transparent mesh pixel
+#           Also provides Normal pass (world-space shading normals) and Z/Depth pass.
+#   Seg   : material_override = fully opaque diffuse → IndexOB records glass pixels
+#           correctly (avoids dotted pattern from Cycles HASHED transparency).
 #
 # Compositor wiring:
-#   Main.Image  → Composite    (RGB output)
-#   Seg.IndexOB → FileOutput   (EXR segmentation)
+#   Main.Image  → Composite        (RGB output via write_still)
+#   Main.Normal → FileOutput EXR   (--normal_output; float32 RGB, range [-1,1])
+#   Main.Depth  → FileOutput EXR   (--depth_output;  float32 RGB broadcast)
+#   Seg.IndexOB → FileOutput EXR   (--seg_output;    float32 RGB broadcast)
 #
-# Blender renders both layers in a single bpy.ops.render.render() call.
-# write_still writes Main's image (the active ViewLayer output).
-if args.seg_output:
-    # ── Main ViewLayer (RGB) ───────────────────────────────────────────────
+# All three EXR files use format RGB / 32-bit float / no compression.
+# Driver reads R channel (or all 3 for normals) after renaming the
+# Blender-appended frame-number suffix off the filename.
+
+need_compositor = bool(args.seg_output or args.normal_output or args.depth_output)
+if need_compositor:
+    # ── Main ViewLayer ────────────────────────────────────────────────────
     vl_main = scene.view_layers[0]
     vl_main.name = 'Main'
-    vl_main.use_pass_object_index = False  # not needed for RGB
+    vl_main.use_pass_object_index = False   # not needed for RGB
+    if args.normal_output:
+        vl_main.use_pass_normal = True
+    if args.depth_output:
+        vl_main.use_pass_z = True
 
-    # ── Seg ViewLayer: fully opaque override so glass pixels get indexed ───
-    # We create a simple opaque diffuse material and assign it as the
-    # ViewLayer's material_override.  This replaces all shaders at render
-    # time (geometry is unchanged), turning every surface opaque so that
-    # Cycles rays always hit the glass mesh and record its pass_index.
-    seg_override = bpy.data.materials.new('_SEG_OPAQUE_OVERRIDE')
-    seg_override.use_nodes = True
-    _sn = seg_override.node_tree.nodes
-    _sn.clear()
-    _so = _sn.new('ShaderNodeOutputMaterial')
-    _sd = _sn.new('ShaderNodeBsdfDiffuse')
-    _sd.inputs['Color'].default_value = (0.5, 0.5, 0.5, 1.0)
-    seg_override.node_tree.links.new(_sd.outputs['BSDF'], _so.inputs['Surface'])
-    seg_override.blend_method   = 'OPAQUE'
-    seg_override.shadow_method  = 'OPAQUE'
+    # ── Seg ViewLayer (only when --seg_output given) ──────────────────────
+    # Fully opaque diffuse override so Cycles rays always hit glass surfaces
+    # and their pass_index values are recorded without transparency dropout.
+    if args.seg_output:
+        seg_override = bpy.data.materials.new('_SEG_OPAQUE_OVERRIDE')
+        seg_override.use_nodes = True
+        _sn = seg_override.node_tree.nodes
+        _sn.clear()
+        _so = _sn.new('ShaderNodeOutputMaterial')
+        _sd = _sn.new('ShaderNodeBsdfDiffuse')
+        _sd.inputs['Color'].default_value = (0.5, 0.5, 0.5, 1.0)
+        seg_override.node_tree.links.new(_sd.outputs['BSDF'], _so.inputs['Surface'])
+        seg_override.blend_method  = 'OPAQUE'
+        seg_override.shadow_method = 'OPAQUE'
 
-    vl_seg = scene.view_layers.new('Seg')
-    vl_seg.use_pass_object_index = True
-    vl_seg.material_override     = seg_override
+        vl_seg = scene.view_layers.new('Seg')
+        vl_seg.use_pass_object_index = True
+        vl_seg.material_override     = seg_override
 
     # ── Compositor ────────────────────────────────────────────────────────
     scene.use_nodes = True
@@ -225,36 +247,84 @@ if args.seg_output:
     tree = scene.node_tree
     tree.nodes.clear()
 
-    # Main layer → RGB composite output
+    # Main layer node — source for RGB, Normal, Depth
     rl_main = tree.nodes.new('CompositorNodeRLayers')
     rl_main.layer = 'Main'
+
+    # Main.Image → Composite (drives the write_still RGB output)
     comp = tree.nodes.new('CompositorNodeComposite')
     tree.links.new(rl_main.outputs['Image'], comp.inputs['Image'])
 
-    # Seg layer → IndexOB → EXR file
-    rl_seg = tree.nodes.new('CompositorNodeRLayers')
-    rl_seg.layer = 'Seg'
+    # ── Normal output ─────────────────────────────────────────────────────
+    # World-space shading normals: R=X, G=Y, B=Z, values in [-1, 1].
+    # Note: OpenCV reads EXR as BGR, so caller must reverse channels to get (X,Y,Z).
+    if args.normal_output:
+        norm_dir  = os.path.dirname(os.path.abspath(args.normal_output))
+        norm_stem = os.path.splitext(os.path.basename(args.normal_output))[0]
+        os.makedirs(norm_dir, exist_ok=True)
+        out_norm = tree.nodes.new('CompositorNodeOutputFile')
+        out_norm.base_path          = norm_dir + os.sep
+        out_norm.format.file_format = 'OPEN_EXR'
+        out_norm.format.color_mode  = 'RGB'
+        out_norm.format.color_depth = '32'
+        out_norm.format.exr_codec   = 'NONE'
+        out_norm.file_slots[0].path = norm_stem
+        norm_socket = rl_main.outputs.get('Normal')
+        if norm_socket:
+            tree.links.new(norm_socket, out_norm.inputs[0])
+        else:
+            print('[normal] WARNING: Normal socket not found on Main layer — '
+                  'enable use_pass_normal or check Blender version')
 
-    seg_dir  = os.path.dirname(os.path.abspath(args.seg_output))
-    seg_stem = os.path.splitext(os.path.basename(args.seg_output))[0]
-    os.makedirs(seg_dir, exist_ok=True)
+    # ── Depth output ──────────────────────────────────────────────────────
+    # Camera-space distance in metres, broadcast to RGB channels.
+    # Background pixels have very large values (~1e10); caller should clip.
+    if args.depth_output:
+        depth_dir  = os.path.dirname(os.path.abspath(args.depth_output))
+        depth_stem = os.path.splitext(os.path.basename(args.depth_output))[0]
+        os.makedirs(depth_dir, exist_ok=True)
+        out_depth = tree.nodes.new('CompositorNodeOutputFile')
+        out_depth.base_path          = depth_dir + os.sep
+        out_depth.format.file_format = 'OPEN_EXR'
+        out_depth.format.color_mode  = 'RGB'   # depth broadcast to R=G=B for easy read
+        out_depth.format.color_depth = '32'
+        out_depth.format.exr_codec   = 'NONE'
+        out_depth.file_slots[0].path = depth_stem
+        # Socket is 'Depth' in Blender 3.x+, 'Z' in older versions
+        depth_socket = rl_main.outputs.get('Depth') or rl_main.outputs.get('Z')
+        if depth_socket:
+            tree.links.new(depth_socket, out_depth.inputs[0])
+        else:
+            print('[depth] WARNING: Depth/Z socket not found on Main layer — '
+                  'enable use_pass_z or check Blender version')
 
-    out_seg = tree.nodes.new('CompositorNodeOutputFile')
-    out_seg.base_path             = seg_dir + os.sep
-    out_seg.format.file_format    = 'OPEN_EXR'
-    out_seg.format.color_mode     = 'RGB'   # IndexOB value broadcast to R=G=B; read R in Python
-    out_seg.format.color_depth    = '32'
-    out_seg.format.exr_codec      = 'NONE'
-    out_seg.file_slots[0].path    = seg_stem
+    # ── Segmentation output ───────────────────────────────────────────────
+    # IndexOB (pass_index per pixel) from opaque-override Seg layer.
+    if args.seg_output:
+        rl_seg = tree.nodes.new('CompositorNodeRLayers')
+        rl_seg.layer = 'Seg'
 
-    # IndexOB socket name varies by Blender version
-    idx_socket = (rl_seg.outputs.get('IndexOB') or rl_seg.outputs.get('Object Index'))
-    if idx_socket:
-        tree.links.new(idx_socket, out_seg.inputs[0])
-    else:
-        print('[seg] WARNING: IndexOB socket not found on Seg layer — segmentation will be empty')
+        seg_dir  = os.path.dirname(os.path.abspath(args.seg_output))
+        seg_stem = os.path.splitext(os.path.basename(args.seg_output))[0]
+        os.makedirs(seg_dir, exist_ok=True)
 
-    scene.frame_current = 0   # → suffix "0000" on output filename
+        out_seg = tree.nodes.new('CompositorNodeOutputFile')
+        out_seg.base_path          = seg_dir + os.sep
+        out_seg.format.file_format = 'OPEN_EXR'
+        out_seg.format.color_mode  = 'RGB'   # IndexOB broadcast to R=G=B; read R in Python
+        out_seg.format.color_depth = '32'
+        out_seg.format.exr_codec   = 'NONE'
+        out_seg.file_slots[0].path = seg_stem
+
+        # Socket name varies by Blender version
+        idx_socket = (rl_seg.outputs.get('IndexOB') or rl_seg.outputs.get('Object Index'))
+        if idx_socket:
+            tree.links.new(idx_socket, out_seg.inputs[0])
+        else:
+            print('[seg] WARNING: IndexOB socket not found on Seg layer — '
+                  'segmentation output will be empty')
+
+    scene.frame_current = 0   # → suffix "0000" on all FileOutput filenames
 
 # ── Camera ────────────────────────────────────────────────────────────────
 bpy.ops.object.camera_add()
@@ -289,16 +359,25 @@ else:
 # ── Render ────────────────────────────────────────────────────────────────
 bpy.ops.render.render(write_still=True)
 
-# Compositor wrote the segmentation EXR with a frame-number suffix.
-# Rename it to exactly --seg_output so the driver can find it reliably.
-if args.seg_output:
-    seg_dir  = os.path.dirname(os.path.abspath(args.seg_output))
-    seg_stem = os.path.splitext(os.path.basename(args.seg_output))[0]
-    matches  = sorted(glob.glob(os.path.join(seg_dir, f'{seg_stem}????.exr')))
-    if matches:
-        os.replace(matches[0], args.seg_output)
-        print(f'Segmentation EXR saved to {args.seg_output}')
+# Compositor writes EXR files with a frame-number suffix (e.g. "seg0000.exr").
+# Rename each to its exact target path so the driver can find them reliably.
+
+def _rename_exr(target_path, tag):
+    d    = os.path.dirname(os.path.abspath(target_path))
+    stem = os.path.splitext(os.path.basename(target_path))[0]
+    # Blender appends a 4-digit frame number before the extension
+    hits = sorted(glob.glob(os.path.join(d, f'{stem}????.exr')))
+    if hits:
+        os.replace(hits[0], target_path)
+        print(f'{tag} EXR saved to {target_path}')
     else:
-        print(f'[seg] WARNING: no EXR found matching {seg_stem}????.exr in {seg_dir}')
+        print(f'[{tag}] WARNING: no EXR found matching {stem}????.exr in {d}')
+
+if args.seg_output:
+    _rename_exr(args.seg_output, 'Segmentation')
+if args.normal_output:
+    _rename_exr(args.normal_output, 'Normal')
+if args.depth_output:
+    _rename_exr(args.depth_output, 'Depth')
 
 print(f'Rendered to {args.output}')
