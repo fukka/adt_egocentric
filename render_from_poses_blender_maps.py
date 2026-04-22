@@ -721,7 +721,9 @@ def main():
                 print(f'    [depth] cv2 could not read {depth_exr_tmp}; skipping')
             else:
                 depth = depth_bgr[..., 0].astype(np.float32)  # R channel = depth
-                # Mark sky/background (very large values) as inf
+                # Background/sky pixels have the Blender sentinel value (~1e10).
+                # The opaque-override Aux layer ensures every surface is solid,
+                # so only true background rays produce these huge values.
                 depth[depth > 1e6] = np.inf
 
                 if args.fisheye and fisheye_remap is not None:
