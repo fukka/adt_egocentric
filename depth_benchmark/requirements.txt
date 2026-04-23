@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Depth Estimation Benchmark — Python dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+# Install with:
+#   pip install -r requirements.txt
+#
+# For GPU support, install the CUDA-enabled PyTorch first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# then run:
+#   pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Core
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0
+Pillow>=9.5.0
+matplotlib>=3.7.0
+scipy>=1.10.0
+
+# ── Depth Anything V2 ────────────────────────────────────────────────────────
+# Uses the HuggingFace Hub pipeline
+transformers>=4.40.0
+accelerate>=0.27.0
+
+# ── Marigold ─────────────────────────────────────────────────────────────────
+# Uses the diffusers library (Stable Diffusion-based)
+diffusers>=0.28.0
+# LCM variant also needs:
+# (no extra deps; included in diffusers>=0.28)
+
+# ── UniDepth v2 ──────────────────────────────────────────────────────────────
+# Install from source (not on PyPI):
+#   pip install git+https://github.com/lpiccinelli-eth/UniDepth.git
+# Deps pulled in by UniDepth:
+einops>=0.7.0
+timm>=0.9.0
+huggingface_hub>=0.21.0
+
+# ── Metric3D v2 ──────────────────────────────────────────────────────────────
+# Loaded via torch.hub ('YvanYin/Metric3D') — no separate install needed.
+# The hub download requires internet access on the first run.
+# Optional: mmcv if you use the mmdet-based variant
+# mmcv>=2.0.0   # uncomment only if needed
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+opencv-python>=4.8.0
+tqdm>=4.65.0
