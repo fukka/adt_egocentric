@@ -80,12 +80,13 @@ def upscale_inputs(img_arr: np.ndarray,
         Image.fromarray(img_arr).resize((new_W, new_H), Image.LANCZOS)
     )
 
-    # ── Upscale segmentation map (NEAREST, via int32 PIL mode 'I') ─────────
-    # PIL doesn't support int64 natively; UIDs fit comfortably in int32.
-    seg_pil = Image.fromarray(seg_uid.astype(np.int32), mode='I')
-    seg_up  = np.array(
-        seg_pil.resize((new_W, new_H), Image.NEAREST)
-    ).astype(np.int64)
+    # ── Upscale segmentation map (NEAREST, pure numpy index mapping) ────────
+    # PIL's int32 mode would corrupt UIDs larger than 2^31-1.
+    # Instead, build integer row/col lookup arrays and fancy-index directly —
+    # int64 values pass through without any type conversion.
+    row_idx = np.floor(np.arange(new_H) * H / new_H).astype(np.intp).clip(0, H - 1)
+    col_idx = np.floor(np.arange(new_W) * W / new_W).astype(np.intp).clip(0, W - 1)
+    seg_up  = seg_uid[np.ix_(row_idx, col_idx)]   # (new_H, new_W), still int64
 
     return img_up, seg_up
 
