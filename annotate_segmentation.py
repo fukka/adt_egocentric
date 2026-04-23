@@ -14,11 +14,18 @@ Usage:
         [--render_dir /path/to/blender_rendered_maps] \
         [--output_dir /path/to/output] \
         [--min_px 200]          # ignore objects smaller than this (px)
+        [--upscale 2.0]         # upscale image (not font) to reduce label overlap
         [--on_real]             # also annotate the real ego frame (needs VRS)
 
 Output:
     <output_dir>/annotated_render_NNNN.png   — labels on Blender render
     <output_dir>/annotated_real_NNNN.png     — labels on real ego frame
+
+Upscale note:
+    --upscale enlarges the canvas so labels have more room without changing font
+    size.  The image is resized with LANCZOS; the segmentation map is resized
+    with NEAREST so integer UIDs are preserved exactly.  --min_px is
+    automatically scaled by upscale² so it stays consistent in object-size terms.
 """
 
 import sys, os, csv, json, argparse
@@ -48,6 +55,39 @@ def load_font(size=14):
             except Exception:
                 pass
     return ImageFont.load_default()
+
+
+def upscale_inputs(img_arr: np.ndarray,
+                   seg_uid: np.ndarray,
+                   factor: float):
+    """
+    Upscale the image and segmentation map by *factor*.
+
+    • Image   — LANCZOS (high-quality, anti-aliased)
+    • Seg map — NEAREST  (preserves exact integer UIDs; no blending)
+
+    Returns (img_arr_up, seg_uid_up) at the new resolution.
+    """
+    if factor == 1.0:
+        return img_arr, seg_uid
+
+    H, W = seg_uid.shape
+    new_W = int(round(W * factor))
+    new_H = int(round(H * factor))
+
+    # ── Upscale image (LANCZOS) ────────────────────────────────────────────
+    img_up = np.array(
+        Image.fromarray(img_arr).resize((new_W, new_H), Image.LANCZOS)
+    )
+
+    # ── Upscale segmentation map (NEAREST, via int32 PIL mode 'I') ─────────
+    # PIL doesn't support int64 natively; UIDs fit comfortably in int32.
+    seg_pil = Image.fromarray(seg_uid.astype(np.int32), mode='I')
+    seg_up  = np.array(
+        seg_pil.resize((new_W, new_H), Image.NEAREST)
+    ).astype(np.int64)
+
+    return img_up, seg_up
 
 
 def uid_color(uid: int):
@@ -171,6 +211,12 @@ def main():
     parser.add_argument('--min_px', type=int, default=200,
                         help='Skip objects with fewer visible pixels than this (default: 200)')
     parser.add_argument('--font_size', type=int, default=13)
+    parser.add_argument('--upscale', type=float, default=1.0,
+                        help='Scale factor applied to the image canvas before labelling '
+                             '(e.g. 2.0 → double resolution).  Font size is NOT scaled, '
+                             'so labels stay the same size while objects spread further '
+                             'apart, reducing overlap.  min_px is auto-scaled by '
+                             'upscale^2 to keep the same object-size threshold.')
     parser.add_argument('--on_real', action='store_true',
                         help='Also annotate the real ego-camera frame from the VRS')
     args = parser.parse_args()
@@ -206,14 +252,23 @@ def main():
     print(f'Frame {idx_str}: {len(unique_uids)} visible objects '
           f'(≥{args.min_px}px threshold will reduce this)')
 
+    # ── Effective min_px after upscaling (object pixel count grows by factor²) ─
+    upscale      = max(args.upscale, 0.1)   # guard against zero/negative
+    min_px_scaled = int(args.min_px * upscale ** 2)
+    if upscale != 1.0:
+        print(f'Upscale ×{upscale:.2f}: canvas {seg_uid.shape[1]}×{seg_uid.shape[0]}'
+              f' → {int(seg_uid.shape[1]*upscale)}×{int(seg_uid.shape[0]*upscale)}, '
+              f'min_px {args.min_px} → {min_px_scaled}')
+
     # ── Annotate Blender render ─────────────────────────────────────────────
     render_path = os.path.join(args.render_dir, 'rgb', f'frame_{idx_str}.png')
     if not os.path.exists(render_path):
         sys.exit(f'ERROR: render not found at {render_path}')
 
     render_arr = np.array(Image.open(render_path).convert('RGB'))
-    ann_render  = annotate_image(render_arr, seg_uid, uid_to_name,
-                                 min_px=args.min_px,
+    render_arr_up, seg_uid_up = upscale_inputs(render_arr, seg_uid, upscale)
+    ann_render  = annotate_image(render_arr_up, seg_uid_up, uid_to_name,
+                                 min_px=min_px_scaled,
                                  font_size=args.font_size)
 
     out_render = os.path.join(args.output_dir, f'annotated_render_{idx_str}.png')
@@ -228,12 +283,14 @@ def main():
             p_ego    = data_provider.create_vrs_data_provider(EGO_VRS)
             img_data = p_ego.get_image_data_by_index(StreamId('214-1'), args.frame_idx)
             ego_arr  = img_data[0].to_numpy_array()
-            # Resize to match seg map
+            # First resize to match the original (pre-upscale) seg map dimensions,
+            # then upscale together so UID ↔ pixel correspondence is exact.
             H, W = seg_uid.shape
-            ego_pil = Image.fromarray(ego_arr).resize((W, H), Image.LANCZOS)
+            ego_pil    = Image.fromarray(ego_arr).resize((W, H), Image.LANCZOS)
             ego_arr_rs = np.array(ego_pil.convert('RGB'))
-            ann_real = annotate_image(ego_arr_rs, seg_uid, uid_to_name,
-                                      min_px=args.min_px,
+            ego_arr_up, seg_uid_up_real = upscale_inputs(ego_arr_rs, seg_uid, upscale)
+            ann_real = annotate_image(ego_arr_up, seg_uid_up_real, uid_to_name,
+                                      min_px=min_px_scaled,
                                       font_size=args.font_size)
             out_real = os.path.join(args.output_dir, f'annotated_real_{idx_str}.png')
             ann_real.save(out_real)
@@ -241,8 +298,8 @@ def main():
         except Exception as e:
             print(f'[warning] Could not annotate real frame: {e}')
 
-    # ── Print object list ───────────────────────────────────────────────────
-    print(f'\nVisible objects (≥{args.min_px} px):')
+    # ── Print object list (pixel counts in original resolution) ────────────
+    print(f'\nVisible objects (≥{args.min_px} px in original resolution):')
     rows = []
     for uid in sorted(unique_uids):
         mask = (seg_uid == uid)
