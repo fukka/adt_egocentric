@@ -3,10 +3,24 @@ eval_depth_anything_v2.py
 =========================
 Benchmark baseline: Depth Anything V2  (NeurIPS 2024)
   Paper : https://arxiv.org/abs/2406.09414
-  Models: depth-anything/Depth-Anything-V2-{Small,Base,Large}-hf  (HuggingFace)
+  Repo  : https://github.com/DepthAnything/Depth-Anything-V2
 
 Depth Anything V2 is an affine-invariant (relative) depth estimator.
 Predicted depth is aligned to GT via least-squares scale+shift before evaluation.
+
+Model loading
+-------------
+Uses the original PyTorch repo directly (no HuggingFace Hub download).
+Before running:
+  1. Clone the repo:
+       git clone https://github.com/DepthAnything/Depth-Anything-V2.git
+  2. Download the checkpoint(s) you need and place them in one directory:
+       depth_anything_v2_vits.pth   (Small)
+       depth_anything_v2_vitb.pth   (Base)
+       depth_anything_v2_vitl.pth   (Large)
+     Checkpoints are linked from the GitHub README (GitHub Releases page).
+  3. Pass --repo_dir and --ckpt_dir (or set the constants at the top of this
+     file) so the script can find the code and weights.
 
 Usage
 -----
@@ -14,6 +28,8 @@ Usage
       --rgb       /path/to/frame_0000.png \\
       --depth_gt  /path/to/frame_0000.npy \\
       --output_dir /path/to/output \\
+      --repo_dir  /path/to/Depth-Anything-V2 \\
+      --ckpt_dir  /path/to/checkpoints \\
       [--variant  small|base|large]         (default: large) \\
       [--rotation 0|90|180|270]             (default: 0) \\
       [--depth_scale 1.0]                   (default: 1.0; use 0.001 for mm→m) \\
@@ -22,7 +38,8 @@ Usage
 
 Dependencies
 ------------
-  pip install torch torchvision transformers pillow numpy matplotlib
+  pip install torch torchvision pillow numpy matplotlib
+  (transformers is no longer required)
 """
 
 import argparse
@@ -41,10 +58,19 @@ from eval_utils import (
     save_comparison_figure, append_to_csv,
 )
 
-MODEL_IDS = {
-    "small": "depth-anything/Depth-Anything-V2-Small-hf",
-    "base":  "depth-anything/Depth-Anything-V2-Base-hf",
-    "large": "depth-anything/Depth-Anything-V2-Large-hf",
+# ── Model configuration ────────────────────────────────────────────────────
+# encoder architecture and DPT head dimensions for each variant
+MODEL_CONFIGS = {
+    "small": {"encoder": "vits", "features": 64,  "out_channels": [48,  96,  192,  384]},
+    "base":  {"encoder": "vitb", "features": 128, "out_channels": [96,  192, 384,  768]},
+    "large": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
+}
+
+# Checkpoint filename for each variant (placed in --ckpt_dir)
+CKPT_NAMES = {
+    "small": "depth_anything_v2_vits.pth",
+    "base":  "depth_anything_v2_vitb.pth",
+    "large": "depth_anything_v2_vitl.pth",
 }
 
 
@@ -52,44 +78,54 @@ MODEL_IDS = {
 
 def run_depth_anything_v2(rgb_np: np.ndarray,
                            variant: str,
-                           device: str) -> np.ndarray:
+                           device: str,
+                           repo_dir: str,
+                           ckpt_dir: str) -> np.ndarray:
     """
-    Run Depth Anything V2 inference.
+    Run Depth Anything V2 inference using the original PyTorch repo.
 
     Parameters
     ----------
-    rgb_np  : uint8 (H, W, 3) RGB numpy array
-    variant : 'small' | 'base' | 'large'
-    device  : 'cuda' | 'cpu'
+    rgb_np   : uint8 (H, W, 3) RGB numpy array
+    variant  : 'small' | 'base' | 'large'
+    device   : 'cuda' | 'cpu'
+    repo_dir : path to the cloned Depth-Anything-V2 repo root
+    ckpt_dir : directory containing the .pth checkpoint files
 
     Returns
     -------
     np.ndarray float32 (H, W) — relative depth (arbitrary scale, NOT metric)
     """
-    from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+    # Make the repo's own modules importable
+    if repo_dir not in sys.path:
+        sys.path.insert(0, repo_dir)
 
-    model_id = MODEL_IDS[variant]
-    print(f"  [DAv2] Loading model: {model_id}")
+    try:
+        from depth_anything_v2.dpt import DepthAnythingV2
+    except ImportError as e:
+        raise ImportError(
+            f"Could not import DepthAnythingV2 from '{repo_dir}'. "
+            "Make sure --repo_dir points to the cloned "
+            "https://github.com/DepthAnything/Depth-Anything-V2 root."
+        ) from e
 
-    processor = AutoImageProcessor.from_pretrained(model_id)
-    model = AutoModelForDepthEstimation.from_pretrained(model_id,
-                                                        torch_dtype=torch.float16 if device == "cuda" else torch.float32)
-    model.to(device).eval()
+    ckpt_path = os.path.join(ckpt_dir, CKPT_NAMES[variant])
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"Checkpoint not found: {ckpt_path}\n"
+            f"Download '{CKPT_NAMES[variant]}' and place it in --ckpt_dir."
+        )
 
-    image = Image.fromarray(rgb_np)
-    inputs = processor(images=image, return_tensors="pt").to(device)
+    print(f"  [DAv2] Loading checkpoint: {ckpt_path}")
+    model = DepthAnythingV2(**MODEL_CONFIGS[variant])
+    model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+    model = model.to(device).eval()
 
+    # infer_image handles internal preprocessing and returns an HxW float32 array
     with torch.no_grad():
-        outputs = model(**inputs)
-        # interpolate to original resolution
-        pred = torch.nn.functional.interpolate(
-            outputs.predicted_depth.unsqueeze(1),
-            size=rgb_np.shape[:2],
-            mode="bicubic",
-            align_corners=False,
-        ).squeeze().cpu().float().numpy()
+        pred = model.infer_image(rgb_np)
 
-    return pred
+    return pred.astype(np.float32)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -101,6 +137,11 @@ def main():
     parser.add_argument("--rgb",        required=True, help="Path to input RGB image")
     parser.add_argument("--depth_gt",   required=True, help="Path to GT depth .npy")
     parser.add_argument("--output_dir", required=True, help="Directory for outputs")
+    parser.add_argument("--repo_dir",   required=True,
+                        help="Path to the cloned Depth-Anything-V2 repo root "
+                             "(https://github.com/DepthAnything/Depth-Anything-V2)")
+    parser.add_argument("--ckpt_dir",   required=True,
+                        help="Directory containing depth_anything_v2_vit{s,b,l}.pth checkpoints")
     parser.add_argument("--variant",    default="large", choices=["small", "base", "large"],
                         help="Model variant (default: large)")
     parser.add_argument("--rotation",   type=int, default=0, choices=[0, 90, 180, 270],
@@ -144,7 +185,8 @@ def main():
 
     # ── Inference ────────────────────────────────────────────────────────────
     print(f"  [DAv2] Running inference (variant={args.variant}) …")
-    pred_raw = run_depth_anything_v2(rgb, variant=args.variant, device=args.device)
+    pred_raw = run_depth_anything_v2(rgb, variant=args.variant, device=args.device,
+                                     repo_dir=args.repo_dir, ckpt_dir=args.ckpt_dir)
     print(f"         Pred shape  : {pred_raw.shape}")
 
     # ── Alignment (affine: scale + shift) ───────────────────────────────────
