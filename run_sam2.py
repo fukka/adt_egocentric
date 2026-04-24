@@ -285,28 +285,114 @@ n_25  = sum(1 for v in ious if v >= 0.25)
 n_50  = sum(1 for v in ious if v >= 0.50)
 n_75  = sum(1 for v in ious if v >= 0.75)
 
-# mAP@[0.5:0.95] — COCO-style final score
-# For each threshold t, recall = fraction of GT instances where best_iou >= t.
-# The final score is the mean of these recalls across 10 thresholds.
-# This mirrors COCO AP but measured as GT-to-prediction recall (no duplicate
-# suppression needed here since each GT is matched independently).
-map_recalls = [sum(1 for v in ious if v >= t) / n for t in MAP_THRESHOLDS]
-map_score   = float(np.mean(map_recalls))
+# ── Build sam_to_gt_map for AP and precision metrics ───────────────────────
+# Maps each SAM mask index to the (uid, best_iou) pairs of GT instances for
+# which it is the best-matching mask.  Consistent with per-instance matching
+# above: each GT independently chose its best SAM mask; duplicates are kept.
+sam_to_gt_map = {}
+for inst in per_instance:
+    idx = inst['best_sam_idx']
+    if idx < 0:
+        continue
+    sam_to_gt_map.setdefault(idx, []).append((inst['uid'], inst['best_iou']))
+
+n_sam = len(masks)
+
+# SAM masks sorted by predicted_iou descending — confidence proxy for AP curve
+sam_sorted = sorted(range(n_sam),
+                    key=lambda i: masks[i]['predicted_iou'], reverse=True)
+
+
+def _compute_ap(sam_sorted, sam_to_gt_map, n_gt, iou_thr):
+    """
+    AP at a single IoU threshold, COCO 101-point interpolation.
+
+    Predictions are processed highest-confidence first.  A mask is TP if it
+    is the best match for at least one GT with best_iou ≥ iou_thr (duplicate
+    matching preserved: same mask may cover multiple GTs simultaneously).
+    Recall = fraction of distinct GT instances covered so far.
+    """
+    if n_gt == 0:
+        return 0.0
+
+    gts_covered   = set()
+    cum_tp = cum_fp = 0
+    prec_pts = []
+    rec_pts  = []
+
+    for sam_idx in sam_sorted:
+        matched_uids = [uid for uid, iou in sam_to_gt_map.get(sam_idx, [])
+                        if iou >= iou_thr]
+        if matched_uids:
+            cum_tp += 1
+            gts_covered.update(matched_uids)
+        else:
+            cum_fp += 1
+        prec_pts.append(cum_tp / (cum_tp + cum_fp))
+        rec_pts.append(len(gts_covered) / n_gt)
+
+    # 101-point interpolation: for each recall level r, take max precision ≥ r
+    ap = 0.0
+    for r_thr in np.linspace(0, 1, 101):
+        precs = [p for p, r in zip(prec_pts, rec_pts) if r >= r_thr]
+        ap   += max(precs) if precs else 0.0
+    return ap / 101
+
+
+# mAP@[0.5:0.95] — true COCO-style mean AP across 10 IoU thresholds
+ap_per_thr = [_compute_ap(sam_sorted, sam_to_gt_map, n, t) for t in MAP_THRESHOLDS]
+map_score  = float(np.mean(ap_per_thr))
+
+# mAR@[0.5:0.95] — mean recall over the same thresholds (kept from before)
+mar_recalls = [sum(1 for v in ious if v >= t) / n for t in MAP_THRESHOLDS]
+mar_score   = float(np.mean(mar_recalls))
+
+# ── Precision@0.50 / 0.75 ─────────────────────────────────────────────────
+# Fraction of SAM masks that are the best match for at least one GT at IoU ≥ t.
+# Masks with no GT match (or only low-IoU matches) count as false positives.
+def _precision_at(thr):
+    tp = sum(1 for matches in sam_to_gt_map.values()
+             if any(iou >= thr for _, iou in matches))
+    return tp / n_sam if n_sam > 0 else 0.0
+
+prec_50 = _precision_at(0.50)
+prec_75 = _precision_at(0.75)
+
+# ── Recall@0.50 / 0.75 (fraction form, for F1) ────────────────────────────
+rec_50 = n_50 / n if n > 0 else 0.0
+rec_75 = n_75 / n if n > 0 else 0.0
+
+# ── F1@0.50 / 0.75 ────────────────────────────────────────────────────────
+def _f1(p, r):
+    return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+
+f1_50 = _f1(prec_50, rec_50)
+f1_75 = _f1(prec_75, rec_75)
 
 summary = {
     'n_gt_instances':      n,
     'min_px_threshold':    MIN_PX,
-    'sam_masks_generated': len(masks),
+    'sam_masks_generated': n_sam,
     'mean_iou':            round(mean_iou, 6),
     'median_iou':          round(median_iou, 6),
     'n_iou_25':            n_25,
     'n_iou_50':            n_50,
     'n_iou_75':            n_75,
-    # Final score — COCO-style mAP averaged over IoU thresholds 0.50…0.95
+    # Recall / Precision / F1 at fixed thresholds
+    'recall_50':           round(rec_50, 6),
+    'recall_75':           round(rec_75, 6),
+    'precision_50':        round(prec_50, 6),
+    'precision_75':        round(prec_75, 6),
+    'f1_50':               round(f1_50, 6),
+    'f1_75':               round(f1_75, 6),
+    # mAP@[0.5:0.95] — true COCO AP (precision-recall AUC per threshold, averaged)
     'mAP_50_95':           round(map_score, 6),
-    'mAP_threshold_recalls': {
-        f'{t:.2f}': round(r, 4) for t, r in zip(MAP_THRESHOLDS, map_recalls)
-    },
+    'mAP_per_threshold':   {f'{t:.2f}': round(ap, 4)
+                            for t, ap in zip(MAP_THRESHOLDS, ap_per_thr)},
+    # mAR@[0.5:0.95] — mean recall over thresholds (was previously labelled mAP)
+    'mAR_50_95':           round(mar_score, 6),
+    'mAR_per_threshold':   {f'{t:.2f}': round(r, 4)
+                            for t, r in zip(MAP_THRESHOLDS, mar_recalls)},
 }
 
 results = {'summary': summary, 'per_instance': per_instance}
@@ -315,10 +401,10 @@ with open(f'{ADT_DIR}/sam2_iou_results.json', 'w') as f:
 
 print("\n" + "=" * 60)
 print(f"SAM 2.1 Large  |  Frame {FRAME_IDX}  |  GT instances (≥{MIN_PX} px): {n}")
-print(f"  Mean IoU:   {mean_iou:.3f}  |  Median IoU: {median_iou:.3f}")
-print(f"  IoU ≥ 0.50: {n_50}/{n} ({100*n_50/n:.1f}%)  |  "
-      f"IoU ≥ 0.75: {n_75}/{n} ({100*n_75/n:.1f}%)")
-print(f"  ── FINAL SCORE  mAP@[0.5:0.95] = {map_score:.4f} ──")
+print(f"  Mean IoU:    {mean_iou:.3f}  |  Median IoU:  {median_iou:.3f}")
+print(f"  Recall@0.50: {rec_50:.3f}  |  Precision@0.50: {prec_50:.3f}  |  F1@0.50: {f1_50:.3f}")
+print(f"  Recall@0.75: {rec_75:.3f}  |  Precision@0.75: {prec_75:.3f}  |  F1@0.75: {f1_75:.3f}")
+print(f"  ── mAP@[0.5:0.95] = {map_score:.4f}  |  mAR@[0.5:0.95] = {mar_score:.4f} ──")
 print("=" * 60)
 
 
@@ -363,12 +449,12 @@ fig.text(0.5, 0.955,
          'SAM 2.1 Large — Egocentric Frame 0 Segmentation Evaluation',
          ha='center', fontsize=17, color='white', fontweight='bold')
 fig.text(0.5, 0.924,
-         f"GT instances ≥{MIN_PX} px: {n}  |  SAM masks: {len(masks)}  |  "
-         f"Mean IoU: {mean_iou:.3f}  |  Median IoU: {median_iou:.3f}  |  "
-         f"IoU≥0.50: {n_50}/{n} ({100*n_50/n:.0f}%)  |  "
-         f"IoU≥0.75: {n_75}/{n} ({100*n_75/n:.0f}%)  |  "
-         f"mAP@[0.5:0.95]: {map_score:.4f}",
-         ha='center', fontsize=11.5, color='#dddddd')
+         f"GT: {n} inst ≥{MIN_PX}px  |  SAM masks: {n_sam}  |  "
+         f"Mean IoU: {mean_iou:.3f}  |  "
+         f"P@0.50: {prec_50:.3f}  R@0.50: {rec_50:.3f}  F1@0.50: {f1_50:.3f}  |  "
+         f"P@0.75: {prec_75:.3f}  R@0.75: {rec_75:.3f}  F1@0.75: {f1_75:.3f}  |  "
+         f"mAP@[0.5:0.95]: {map_score:.4f}  mAR@[0.5:0.95]: {mar_score:.4f}",
+         ha='center', fontsize=10.5, color='#dddddd')
 
 # Per-instance table
 ax_table.set_facecolor('#1a1a1a')
@@ -404,7 +490,8 @@ for i, inst in enumerate(per_instance[:MAX_ROWS]):
 
 ax_table.set_title(
     f'Per-Instance IoU — Top {MAX_ROWS} by GT Area  '
-    f'[Final Score  mAP@[0.5:0.95] = {map_score:.4f}]',
+    f'[mAP@[0.5:0.95]={map_score:.4f}  mAR@[0.5:0.95]={mar_score:.4f}  '
+    f'F1@0.50={f1_50:.3f}  F1@0.75={f1_75:.3f}]',
     color='white', fontsize=11, pad=6, fontweight='bold')
 ax_table.legend(handles=[
     mpatches.Patch(color='#6ee86e', label='IoU ≥ 0.75 (Good)'),
