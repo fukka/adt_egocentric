@@ -28,16 +28,28 @@ simultaneously satisfy multiple GTs in B.
 
 Usage
 -----
+  # Metrics only
   python eval_by_size.py \\
       --results  /path/to/sam2_iou_results.json \\
       --masks    /path/to/sam2_masks_f0.json \\
-      [--brackets 0 100 500 2000 10000]     # left edges; rightmost is open (default shown) \\
+      [--brackets 0 100 500 2000 10000] \\
       [--output_dir /path/to/output]
+
+  # Metrics + bracket-coloured mask overlays
+  python eval_by_size.py \\
+      --results    /path/to/sam2_iou_results.json \\
+      --masks      /path/to/sam2_masks_f0.json \\
+      --rgb        /path/to/real_rot90_f0.png \\
+      --gt_seg     /path/to/gt_seg_rot_f0.npy \\
+      --sam_masks  /path/to/sam2_masks_f0.npy \\
+      [--overlay_alpha 0.45]
 
 Outputs
 -------
-  <output_dir>/by_size_metrics.json   — full per-bracket metrics + per-instance listing
-  <output_dir>/by_size_metrics.png    — grouped bar chart across brackets
+  <output_dir>/by_size_metrics.json      — full per-bracket metrics + per-instance listing
+  <output_dir>/by_size_metrics.png       — grouped bar chart across brackets
+  <output_dir>/by_size_overlay.png       — GT + SAM prediction masks coloured by bracket
+                                           (only when --rgb / --gt_seg / --sam_masks given)
 """
 
 import argparse
@@ -50,8 +62,22 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+from PIL import Image
 
 MAP_THRESHOLDS = np.arange(0.50, 1.00, 0.05)   # 0.50, 0.55, …, 0.95
+
+# ── Bracket palette (R, G, B) in 0-255, up to 8 brackets ─────────────────────
+BRACKET_PALETTE = [
+    ( 64, 224, 208),   # turquoise
+    (144, 238,  80),   # lime green
+    (255, 165,   0),   # orange
+    (255,  80, 180),   # hot pink
+    (255,  69,   0),   # red-orange
+    (147, 112, 219),   # medium purple
+    ( 30, 144, 255),   # dodger blue
+    (255, 215,   0),   # gold
+]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -392,6 +418,166 @@ def save_figure(bracket_results: list, output_path: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Bracket-coloured mask overlay
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _blend(canvas: np.ndarray, mask: np.ndarray,
+           color_rgb: tuple, alpha: float) -> None:
+    """In-place alpha-blend color onto canvas pixels where mask is True."""
+    r, g, b = color_rgb
+    for c, val in enumerate((r, g, b)):
+        canvas[:, :, c] = np.where(
+            mask,
+            np.clip((1 - alpha) * canvas[:, :, c] + alpha * val, 0, 255).astype(np.uint8),
+            canvas[:, :, c],
+        )
+
+
+def save_overlay_figures(bracket_results: list,
+                         rgb_np: np.ndarray,
+                         gt_seg: np.ndarray,
+                         sam_masks: np.ndarray,
+                         output_path: str,
+                         alpha: float = 0.45) -> None:
+    """
+    Save a side-by-side figure with two panels:
+      Left  — GT instance masks coloured by size bracket
+      Right — Best-matching SAM prediction masks, same bracket colours
+
+    Parameters
+    ----------
+    bracket_results : list produced by main() (instances include best_sam_idx)
+    rgb_np          : (H, W, 3) uint8 RGB image
+    gt_seg          : (H, W) uint64 GT segmentation UID map
+    sam_masks       : (N, H, W) bool predicted masks from SAM
+    output_path     : destination PNG path
+    alpha           : blending transparency for mask fill  (default 0.45)
+    """
+    H, W = rgb_np.shape[:2]
+    gt_canvas   = rgb_np.copy()
+    pred_canvas = rgb_np.copy()
+
+    # ── Collect bracket info and draw masks ───────────────────────────────────
+    legend_patches = []
+    seen_brackets  = set()
+
+    for b_idx, row in enumerate(bracket_results):
+        if row["metrics"] is None:
+            continue   # empty bracket
+
+        color = BRACKET_PALETTE[b_idx % len(BRACKET_PALETTE)]
+        label = row["label"]
+
+        for inst in row["instances"]:
+            # ── GT mask ───────────────────────────────────────────────────────
+            try:
+                uid_int  = int(inst["uid"])
+                gt_mask  = (gt_seg == uid_int)
+                if gt_mask.any():
+                    _blend(gt_canvas, gt_mask, color, alpha)
+            except (ValueError, OverflowError):
+                pass
+
+            # ── Best-matching SAM prediction mask ─────────────────────────────
+            sam_idx = inst.get("best_sam_idx", -1)
+            if sam_idx >= 0 and sam_idx < len(sam_masks):
+                pred_mask = sam_masks[sam_idx]   # (H, W) bool
+                if pred_mask.shape != (H, W):
+                    # Nearest-neighbour resize to match RGB
+                    pred_mask = np.array(
+                        Image.fromarray(pred_mask.astype(np.uint8) * 255)
+                        .resize((W, H), Image.NEAREST)
+                    ).astype(bool)
+                if pred_mask.any():
+                    _blend(pred_canvas, pred_mask, color, alpha)
+
+        # Legend entry (one per non-empty bracket)
+        if label not in seen_brackets:
+            seen_brackets.add(label)
+            r, g, b = color
+            legend_patches.append(
+                mpatches.Patch(
+                    facecolor=(r / 255, g / 255, b / 255),
+                    label=label,
+                    alpha=0.85,
+                )
+            )
+
+    # ── Draw contours on both panels (thin white outline per instance) ─────────
+    try:
+        import cv2
+        for b_idx, row in enumerate(bracket_results):
+            if row["metrics"] is None:
+                continue
+            color = BRACKET_PALETTE[b_idx % len(BRACKET_PALETTE)]
+            bgr   = (color[2], color[1], color[0])
+
+            for inst in row["instances"]:
+                # GT contour
+                try:
+                    uid_int = int(inst["uid"])
+                    gt_mask = (gt_seg == uid_int).astype(np.uint8)
+                    cnts, _ = cv2.findContours(gt_mask, cv2.RETR_EXTERNAL,
+                                               cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(gt_canvas, cnts, -1, bgr, 1)
+                except (ValueError, OverflowError):
+                    pass
+
+                # Pred contour
+                sam_idx = inst.get("best_sam_idx", -1)
+                if sam_idx >= 0 and sam_idx < len(sam_masks):
+                    pred_mask = sam_masks[sam_idx]
+                    if pred_mask.shape != (H, W):
+                        pred_mask = np.array(
+                            Image.fromarray(pred_mask.astype(np.uint8) * 255)
+                            .resize((W, H), Image.NEAREST)
+                        ).astype(bool)
+                    pmask_u8 = pred_mask.astype(np.uint8)
+                    cnts, _ = cv2.findContours(pmask_u8, cv2.RETR_EXTERNAL,
+                                               cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(pred_canvas, cnts, -1, bgr, 1)
+    except ImportError:
+        pass   # cv2 optional — contours skipped
+
+    # ── Compose figure ────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(22, 11), facecolor="#1a1a2e")
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.08,
+                        wspace=0.04)
+
+    for ax, canvas, title in [
+        (axes[0], gt_canvas,   "GT Instances  (coloured by size bracket)"),
+        (axes[1], pred_canvas, "SAM Best-match Predictions  (same bracket colours)"),
+    ]:
+        ax.imshow(canvas)
+        ax.set_title(title, color="white", fontsize=13, fontweight="bold", pad=8)
+        ax.axis("off")
+        ax.set_facecolor("#1a1a2e")
+
+    # Shared legend below both panels
+    if legend_patches:
+        fig.legend(
+            handles=legend_patches,
+            loc="lower center",
+            ncol=min(len(legend_patches), 6),
+            fontsize=11,
+            framealpha=0.3,
+            labelcolor="white",
+            facecolor="#1a1a2e",
+            edgecolor="#555577",
+            bbox_to_anchor=(0.5, 0.01),
+        )
+
+    fig.suptitle("SAM 2  —  Mask Overlay by GT Instance Size Bracket",
+                 color="white", fontsize=15, fontweight="bold", y=0.97)
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    plt.savefig(output_path, dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  [overlay] Saved → {output_path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -412,6 +598,18 @@ def main():
     parser.add_argument("--output_dir", default=None,
                         help="Directory for output files. Defaults to the directory "
                              "containing --results.")
+    # ── Optional overlay visualisation ────────────────────────────────────────
+    parser.add_argument("--rgb",        default=None,
+                        help="Path to the input RGB image (e.g. real_rot90_f0.png). "
+                             "Required for --gt_seg / --sam_masks overlay.")
+    parser.add_argument("--gt_seg",     default=None,
+                        help="Path to GT segmentation array gt_seg_rot_f0.npy  "
+                             "(H×W uint64, output of run_sam2.py).")
+    parser.add_argument("--sam_masks",  default=None,
+                        help="Path to SAM predicted masks sam2_masks_f0.npy  "
+                             "(N×H×W bool, output of run_sam2.py).")
+    parser.add_argument("--overlay_alpha", type=float, default=0.45,
+                        help="Transparency for mask fill in overlay (default: 0.45).")
     args = parser.parse_args()
 
     if args.output_dir is None:
@@ -479,10 +677,11 @@ def main():
             "metrics":  metrics,
             "instances": [
                 {
-                    "uid":      inst["uid"],
-                    "name":     inst["name"],
-                    "gt_px":    inst["gt_px"],
-                    "best_iou": inst["best_iou"],
+                    "uid":          inst["uid"],
+                    "name":         inst["name"],
+                    "gt_px":        inst["gt_px"],
+                    "best_iou":     inst["best_iou"],
+                    "best_sam_idx": inst.get("best_sam_idx", -1),
                 }
                 for inst in instances
             ],
@@ -497,9 +696,29 @@ def main():
         json.dump(bracket_results, f, indent=2)
     print(f"  [json] Saved → {out_json}")
 
-    # ── Save figure ───────────────────────────────────────────────────────────
+    # ── Save metrics figure ───────────────────────────────────────────────────
     out_fig = os.path.join(args.output_dir, "by_size_metrics.png")
     save_figure(bracket_results, out_fig)
+
+    # ── Save overlay figure (optional) ────────────────────────────────────────
+    overlay_args = [args.rgb, args.gt_seg, args.sam_masks]
+    if any(overlay_args):
+        missing = [name for name, val in zip(
+                       ["--rgb", "--gt_seg", "--sam_masks"], overlay_args)
+                   if val is None]
+        if missing:
+            print(f"\n  [overlay] Skipping — missing argument(s): {', '.join(missing)}")
+        else:
+            print(f"\nLoading overlay inputs …")
+            rgb_np    = np.array(Image.open(args.rgb).convert("RGB"))
+            gt_seg    = np.load(args.gt_seg)
+            sam_masks = np.load(args.sam_masks)
+            print(f"  RGB      : {rgb_np.shape}")
+            print(f"  GT seg   : {gt_seg.shape}  dtype={gt_seg.dtype}")
+            print(f"  SAM masks: {sam_masks.shape}  dtype={sam_masks.dtype}")
+            out_overlay = os.path.join(args.output_dir, "by_size_overlay.png")
+            save_overlay_figures(bracket_results, rgb_np, gt_seg, sam_masks,
+                                 out_overlay, alpha=args.overlay_alpha)
 
     # ── Quick summary ─────────────────────────────────────────────────────────
     print("\nSummary  (brackets with ≥1 instance):")
