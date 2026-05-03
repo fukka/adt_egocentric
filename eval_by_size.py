@@ -40,16 +40,18 @@ Usage
       --results    /path/to/sam2_iou_results.json \\
       --masks      /path/to/sam2_masks_f0.json \\
       --rgb        /path/to/real_rot90_f0.png \\
-      --gt_seg     /path/to/gt_seg_rot_f0.npy \\
-      --sam_masks  /path/to/sam2_masks_f0.npy \\
       [--overlay_alpha 0.45]
+
+  The two companion .npy files are resolved automatically:
+    gt_seg    → <results_dir>/gt_seg_rot_f0.npy
+    sam_masks → <masks_path with .json → .npy>
 
 Outputs
 -------
   <output_dir>/by_size_metrics.json      — full per-bracket metrics + per-instance listing
   <output_dir>/by_size_metrics.png       — grouped bar chart across brackets
   <output_dir>/by_size_overlay.png       — GT + SAM prediction masks coloured by bracket
-                                           (only when --rgb / --gt_seg / --sam_masks given)
+                                           (only when --rgb is given)
 """
 
 import argparse
@@ -600,14 +602,10 @@ def main():
                              "containing --results.")
     # ── Optional overlay visualisation ────────────────────────────────────────
     parser.add_argument("--rgb",        default=None,
-                        help="Path to the input RGB image (e.g. real_rot90_f0.png). "
-                             "Required for --gt_seg / --sam_masks overlay.")
-    parser.add_argument("--gt_seg",     default=None,
-                        help="Path to GT segmentation array gt_seg_rot_f0.npy  "
-                             "(H×W uint64, output of run_sam2.py).")
-    parser.add_argument("--sam_masks",  default=None,
-                        help="Path to SAM predicted masks sam2_masks_f0.npy  "
-                             "(N×H×W bool, output of run_sam2.py).")
+                        help="Path to the input RGB image (e.g. real_rot90_f0.png).  "
+                             "When given, saves by_size_overlay.png.  "
+                             "gt_seg_rot_f0.npy and the SAM masks .npy are "
+                             "resolved automatically from --results / --masks paths.")
     parser.add_argument("--overlay_alpha", type=float, default=0.45,
                         help="Transparency for mask fill in overlay (default: 0.45).")
     args = parser.parse_args()
@@ -700,19 +698,30 @@ def main():
     out_fig = os.path.join(args.output_dir, "by_size_metrics.png")
     save_figure(bracket_results, out_fig)
 
-    # ── Save overlay figure (optional) ────────────────────────────────────────
-    overlay_args = [args.rgb, args.gt_seg, args.sam_masks]
-    if any(overlay_args):
-        missing = [name for name, val in zip(
-                       ["--rgb", "--gt_seg", "--sam_masks"], overlay_args)
-                   if val is None]
+    # ── Save overlay figure (optional — only needs --rgb) ────────────────────
+    if args.rgb:
+        # Derive companion .npy paths automatically
+        results_dir   = os.path.dirname(os.path.abspath(args.results))
+        gt_seg_path   = os.path.join(results_dir, "gt_seg_rot_f0.npy")
+        sam_masks_path = os.path.splitext(os.path.abspath(args.masks))[0] + ".npy"
+
+        missing = [
+            (name, path) for name, path in [
+                ("gt_seg_rot_f0.npy",  gt_seg_path),
+                (os.path.basename(sam_masks_path), sam_masks_path),
+            ] if not os.path.isfile(path)
+        ]
         if missing:
-            print(f"\n  [overlay] Skipping — missing argument(s): {', '.join(missing)}")
+            print(f"\n  [overlay] Skipping — companion .npy file(s) not found:")
+            for name, path in missing:
+                print(f"    {name}  →  {path}")
         else:
             print(f"\nLoading overlay inputs …")
+            print(f"  GT seg   : {gt_seg_path}")
+            print(f"  SAM masks: {sam_masks_path}")
             rgb_np    = np.array(Image.open(args.rgb).convert("RGB"))
-            gt_seg    = np.load(args.gt_seg)
-            sam_masks = np.load(args.sam_masks)
+            gt_seg    = np.load(gt_seg_path)
+            sam_masks = np.load(sam_masks_path)
             print(f"  RGB      : {rgb_np.shape}")
             print(f"  GT seg   : {gt_seg.shape}  dtype={gt_seg.dtype}")
             print(f"  SAM masks: {sam_masks.shape}  dtype={sam_masks.dtype}")
