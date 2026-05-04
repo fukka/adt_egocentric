@@ -42,9 +42,10 @@ Usage
       --rgb        /path/to/real_rot90_f0.png \\
       [--overlay_alpha 0.45]
 
-  The two companion .npy files are resolved automatically:
-    gt_seg    → <results_dir>/gt_seg_rot_f0.npy
-    sam_masks → <masks_path with .json → .npy>
+  The two companion .npy files are resolved from --masks automatically,
+  preserving the shared frame suffix (f0, f150, …):
+    sam2_masks_f0.json  →  sam2_masks_f0.npy   (SAM predicted masks)
+                        →  gt_seg_rot_f0.npy    (GT segmentation, same frame)
 
 Outputs
 -------
@@ -700,10 +701,14 @@ def main():
 
     # ── Save overlay figure (optional — only needs --rgb) ────────────────────
     if args.rgb:
-        # Derive companion .npy paths automatically
-        results_dir   = os.path.dirname(os.path.abspath(args.results))
-        gt_seg_path   = os.path.join(results_dir, "gt_seg_rot_f0.npy")
-        sam_masks_path = os.path.splitext(os.path.abspath(args.masks))[0] + ".npy"
+        # Both .npy files sit alongside sam2_masks_f<N>.json and share the
+        # same frame suffix — sam2_masks_f0 ↔ gt_seg_rot_f0, etc.
+        masks_abs      = os.path.abspath(args.masks)
+        masks_dir      = os.path.dirname(masks_abs)
+        masks_stem     = os.path.splitext(os.path.basename(masks_abs))[0]   # sam2_masks_f0
+        gt_seg_stem    = masks_stem.replace("sam2_masks", "gt_seg_rot")     # gt_seg_rot_f0
+        gt_seg_path    = os.path.join(masks_dir, gt_seg_stem + ".npy")
+        sam_masks_path = os.path.join(masks_dir, masks_stem + ".npy")
 
         missing = [
             (name, path) for name, path in [
