@@ -124,23 +124,33 @@ print(f"  Saved real_rot90_f{FRAME_IDX}.png  shape={real_rot.shape}")
 
 print("\nStep 2: Loading GT instance segmentation")
 
-# Stream 400-1 = per-pixel uint64 instance ID for the RGB camera
-p_seg    = data_provider.create_vrs_data_provider(f'{ADT_DIR}/segmentations.vrs')
-seg_data = p_seg.get_image_data_by_index(StreamId('400-1'), FRAME_IDX)
-seg_raw  = seg_data[0].to_numpy_array()   # (1408, 1408) uint64
+# Load the pre-extracted per-frame segmentation npy produced by the render pipeline.
+# Convention: ADT_DIR/segmentation/frame_NNNN.npy  (int64, already correctly oriented)
+seg_npy_path = os.path.join(ADT_DIR, 'segmentation', f'frame_{FRAME_IDX:04d}.npy')
+if not os.path.isfile(seg_npy_path):
+    sys.exit(f'ERROR: GT segmentation not found: {seg_npy_path}\n'
+             f'  Extract the ADT segmentation zip or run the segmentation pipeline first.')
 
-# Same 90° CW rotation — numpy is used here because PIL cannot handle uint64
-gt_seg = np.rot90(seg_raw, k=-1).copy()
+gt_seg = np.load(seg_npy_path).astype(np.int64)   # (H, W) int64 instance UIDs
 
-# Save the rotated GT segmentation map.
-# eval_by_size.py needs this file for the overlay visualisation.
-# Naming must stay in sync with sam2_masks_f{FRAME_IDX}: gt_seg_rot_f{FRAME_IDX}.npy
-gt_seg_path = f'{ADT_DIR}/gt_seg_rot_f{FRAME_IDX}.npy'
+# If the seg map resolution differs from the real frame (e.g. 512×512 vs 1408×1408),
+# upsample using nearest-neighbour so UIDs are preserved exactly.
+H_rgb, W_rgb = real_rot.shape[:2]
+if gt_seg.shape != (H_rgb, W_rgb):
+    row_idx = np.floor(np.arange(H_rgb) * gt_seg.shape[0] / H_rgb).astype(np.intp).clip(0, gt_seg.shape[0] - 1)
+    col_idx = np.floor(np.arange(W_rgb) * gt_seg.shape[1] / W_rgb).astype(np.intp).clip(0, gt_seg.shape[1] - 1)
+    gt_seg  = gt_seg[np.ix_(row_idx, col_idx)]
+    print(f"  Upsampled seg map → {gt_seg.shape}")
+
+# Cache alongside the SAM outputs so eval_by_size.py can find it.
+# Naming stays in sync with sam2_masks_f{FRAME_IDX}: gt_seg_rot_f{FRAME_IDX}.npy
+gt_seg_path = os.path.join(ADT_DIR, f'gt_seg_rot_f{FRAME_IDX}.npy')
 np.save(gt_seg_path, gt_seg)
 
-unique_ids = np.unique(gt_seg)
+unique_ids  = np.unique(gt_seg)
 n_instances = len(unique_ids[unique_ids != 0])
-print(f"  Saved {gt_seg_path}  instances={n_instances}  "
+print(f"  Loaded  {seg_npy_path}")
+print(f"  Saved   {gt_seg_path}  instances={n_instances}  "
       f"shape={gt_seg.shape}  dtype={gt_seg.dtype}")
 
 # Build a name lookup: instance UID → object name from instances.json
