@@ -39,13 +39,19 @@ Usage
   python eval_by_size.py \\
       --results    /path/to/sam2_iou_results.json \\
       --masks      /path/to/sam2_masks_f0.json \\
-      --rgb        /path/to/real_rot90_f0.png \\
-      [--overlay_alpha 0.45]
+      --rgb        /path/to/real_rot90_f0.png
 
-  The two companion .npy files are resolved from --masks automatically,
-  preserving the shared frame suffix (f0, f150, …):
-    sam2_masks_f0.json  →  sam2_masks_f0.npy   (SAM predicted masks)
-                        →  gt_seg_rot_f0.npy    (GT segmentation, same frame)
+  sam2_masks_f0.npy is resolved from --masks automatically (same path, .json→.npy).
+  GT segmentation is loaded in priority order:
+    1. gt_seg_rot_f0.npy alongside sam2_masks_f0.json  (if it exists)
+    2. --seg_vrs /path/to/segmentations.vrs             (stream 400-1, same rotation)
+
+  python eval_by_size.py \\
+      --results    /path/to/sam2_iou_results.json \\
+      --masks      /path/to/sam2_masks_f0.json \\
+      --rgb        /path/to/real_rot90_f0.png \\
+      --seg_vrs    /path/to/segmentations.vrs \\
+      [--frame_idx 0]   # must match FRAME_IDX used in run_sam2.py
 
 Outputs
 -------
@@ -604,9 +610,14 @@ def main():
     # ── Optional overlay visualisation ────────────────────────────────────────
     parser.add_argument("--rgb",        default=None,
                         help="Path to the input RGB image (e.g. real_rot90_f0.png).  "
-                             "When given, saves by_size_overlay.png.  "
-                             "gt_seg_rot_f0.npy and the SAM masks .npy are "
-                             "resolved automatically from --results / --masks paths.")
+                             "When given, saves by_size_overlay.png.")
+    parser.add_argument("--seg_vrs",    default=None,
+                        help="Path to segmentations.vrs (ADT stream 400-1).  "
+                             "Used to load GT segmentation when gt_seg_rot_f<N>.npy "
+                             "is not found alongside sam2_masks_f<N>.json.")
+    parser.add_argument("--frame_idx",  type=int, default=0,
+                        help="Frame index to read from seg_vrs (default: 0, "
+                             "must match the frame used in run_sam2.py).")
     parser.add_argument("--overlay_alpha", type=float, default=0.45,
                         help="Transparency for mask fill in overlay (default: 0.45).")
     args = parser.parse_args()
@@ -701,31 +712,46 @@ def main():
 
     # ── Save overlay figure (optional — only needs --rgb) ────────────────────
     if args.rgb:
-        # Both .npy files sit alongside sam2_masks_f<N>.json and share the
-        # same frame suffix — sam2_masks_f0 ↔ gt_seg_rot_f0, etc.
+        # ── Resolve SAM masks .npy (same path as .json but .npy) ─────────────
         masks_abs      = os.path.abspath(args.masks)
         masks_dir      = os.path.dirname(masks_abs)
         masks_stem     = os.path.splitext(os.path.basename(masks_abs))[0]   # sam2_masks_f0
-        gt_seg_stem    = masks_stem.replace("sam2_masks", "gt_seg_rot")     # gt_seg_rot_f0
-        gt_seg_path    = os.path.join(masks_dir, gt_seg_stem + ".npy")
         sam_masks_path = os.path.join(masks_dir, masks_stem + ".npy")
 
-        missing = [
-            (name, path) for name, path in [
-                ("gt_seg_rot_f0.npy",  gt_seg_path),
-                (os.path.basename(sam_masks_path), sam_masks_path),
-            ] if not os.path.isfile(path)
-        ]
-        if missing:
-            print(f"\n  [overlay] Skipping — companion .npy file(s) not found:")
-            for name, path in missing:
-                print(f"    {name}  →  {path}")
+        # ── Resolve GT segmentation — prefer .npy, fall back to VRS ──────────
+        gt_seg_stem = masks_stem.replace("sam2_masks", "gt_seg_rot")        # gt_seg_rot_f0
+        gt_seg_path = os.path.join(masks_dir, gt_seg_stem + ".npy")
+
+        gt_seg = None
+
+        if os.path.isfile(gt_seg_path):
+            print(f"\n  GT seg   (npy): {gt_seg_path}")
+            gt_seg = np.load(gt_seg_path)
+        elif args.seg_vrs:
+            print(f"\n  gt_seg_rot*.npy not found — loading from segmentations.vrs …")
+            print(f"  seg_vrs  : {args.seg_vrs}  frame_idx={args.frame_idx}")
+            try:
+                from projectaria_tools.core import data_provider as _dp
+                from projectaria_tools.core.stream_id import StreamId as _SID
+                _p   = _dp.create_vrs_data_provider(args.seg_vrs)
+                _d   = _p.get_image_data_by_index(_SID("400-1"), args.frame_idx)
+                _raw = _d[0].to_numpy_array()               # (H, W) uint64
+                gt_seg = np.rot90(_raw, k=-1).copy()        # same 90° CW as run_sam2.py
+                # Cache to disk so future runs skip this step
+                np.save(gt_seg_path, gt_seg)
+                print(f"  GT seg loaded from VRS and cached → {gt_seg_path}")
+            except Exception as exc:
+                print(f"  [overlay] ERROR loading segmentations.vrs: {exc}")
         else:
+            print(f"\n  [overlay] Skipping GT overlay — {gt_seg_stem}.npy not found "
+                  f"and --seg_vrs not provided.")
+            print(f"    Add --seg_vrs /path/to/segmentations.vrs to enable.")
+
+        if not os.path.isfile(sam_masks_path):
+            print(f"  [overlay] Skipping — SAM masks .npy not found: {sam_masks_path}")
+        elif gt_seg is not None:
             print(f"\nLoading overlay inputs …")
-            print(f"  GT seg   : {gt_seg_path}")
-            print(f"  SAM masks: {sam_masks_path}")
             rgb_np    = np.array(Image.open(args.rgb).convert("RGB"))
-            gt_seg    = np.load(gt_seg_path)
             sam_masks = np.load(sam_masks_path)
             print(f"  RGB      : {rgb_np.shape}")
             print(f"  GT seg   : {gt_seg.shape}  dtype={gt_seg.dtype}")

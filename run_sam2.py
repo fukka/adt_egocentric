@@ -29,13 +29,14 @@ Pipeline
 
 Outputs
 -------
-  real_rot90_f0.png       Real RGB frame, 90° CW rotated
-  gt_seg_rot_f0.npy       GT segmentation array (1408×1408 uint64), same rotation
-  sam2_masks_f0.npy       SAM 2 masks rescaled to 1408×1408 — shape (N, H, W) bool
-  sam2_masks_f0.json      Per-mask metadata (area, predicted IoU, stability score)
-  sam2_overlay_f0.png     SAM 2 masks overlaid on the real frame (1024×1024)
+  real_rot90_f<N>.png     Real RGB frame, 90° CW rotated
+  gt_seg_rot_f<N>.npy     GT segmentation array (1408×1408 uint64), same rotation
+  sam2_masks_f<N>.npy     SAM 2 masks rescaled to 1408×1408 — shape (N, H, W) bool
+  sam2_masks_f<N>.json    Per-mask metadata (area, predicted IoU, stability score)
+  sam2_overlay_f<N>.png   SAM 2 masks overlaid on the real frame (1024×1024)
   sam2_iou_results.json   Per-instance IoU + summary + mAP@[0.5:0.95] final score
-  sam2_report_f0.png      Visual report: real frame / GT / SAM 2 overlay + IoU table
+  sam2_report_f<N>.png    Visual report: real frame / GT / SAM 2 overlay + IoU table
+  (where <N> = FRAME_IDX constant, default 0)
 
 Usage
 -----
@@ -113,8 +114,8 @@ raw      = img_data[0].to_numpy_array()   # (1408, 1408, 3) uint8, sideways
 # The Aria RGB camera is mounted 90° CCW from natural upright.
 # Rotate 90° CW (k=-1) to restore the upright orientation used throughout.
 real_rot = np.rot90(raw, k=-1).copy()
-Image.fromarray(real_rot).save(f'{ADT_DIR}/real_rot90_f0.png')
-print(f"  Saved real_rot90_f0.png  shape={real_rot.shape}")
+Image.fromarray(real_rot).save(f'{ADT_DIR}/real_rot90_f{FRAME_IDX}.png')
+print(f"  Saved real_rot90_f{FRAME_IDX}.png  shape={real_rot.shape}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -130,11 +131,16 @@ seg_raw  = seg_data[0].to_numpy_array()   # (1408, 1408) uint64
 
 # Same 90° CW rotation — numpy is used here because PIL cannot handle uint64
 gt_seg = np.rot90(seg_raw, k=-1).copy()
-np.save(f'{ADT_DIR}/gt_seg_rot_f0.npy', gt_seg)
+
+# Save the rotated GT segmentation map.
+# eval_by_size.py needs this file for the overlay visualisation.
+# Naming must stay in sync with sam2_masks_f{FRAME_IDX}: gt_seg_rot_f{FRAME_IDX}.npy
+gt_seg_path = f'{ADT_DIR}/gt_seg_rot_f{FRAME_IDX}.npy'
+np.save(gt_seg_path, gt_seg)
 
 unique_ids = np.unique(gt_seg)
 n_instances = len(unique_ids[unique_ids != 0])
-print(f"  Saved gt_seg_rot_f0.npy  instances={n_instances}  "
+print(f"  Saved {gt_seg_path}  instances={n_instances}  "
       f"shape={gt_seg.shape}  dtype={gt_seg.dtype}")
 
 # Build a name lookup: instance UID → object name from instances.json
@@ -196,7 +202,7 @@ for m in masks:
     masks_full.append(full)
 
 masks_arr = np.stack(masks_full, axis=0)   # (N, 1408, 1408) bool
-np.save(f'{ADT_DIR}/sam2_masks_f0.npy', masks_arr)
+np.save(f'{ADT_DIR}/sam2_masks_f{FRAME_IDX}.npy', masks_arr)
 
 # Save per-mask metadata
 mask_meta = [{
@@ -207,7 +213,7 @@ mask_meta = [{
     'stability_score': float(m['stability_score']),
     'bbox_xywh': [int(x) for x in m['bbox']],
 } for i, m in enumerate(masks)]
-with open(f'{ADT_DIR}/sam2_masks_f0.json', 'w') as f:
+with open(f'{ADT_DIR}/sam2_masks_f{FRAME_IDX}.json', 'w') as f:
     json.dump(mask_meta, f, indent=2)
 
 # Quick overlay visualisation (saved at 1024 resolution for compact file size)
@@ -217,9 +223,9 @@ for m in masks:
     col = np.random.randint(60, 240, 3).astype(float)
     overlay[m['segmentation']] = col
 blended = (real_1024.astype(float) * 0.45 + overlay * 0.55).clip(0, 255).astype(np.uint8)
-Image.fromarray(blended).save(f'{ADT_DIR}/sam2_overlay_f0.png')
+Image.fromarray(blended).save(f'{ADT_DIR}/sam2_overlay_f{FRAME_IDX}.png')
 
-print(f"  Saved sam2_masks_f0.npy {masks_arr.shape}, sam2_masks_f0.json, sam2_overlay_f0.png")
+print(f"  Saved sam2_masks_f{FRAME_IDX}.npy {masks_arr.shape}, sam2_masks_f{FRAME_IDX}.json, sam2_overlay_f{FRAME_IDX}.png")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -501,9 +507,9 @@ ax_table.legend(handles=[
 ], loc='lower right', fontsize=8, framealpha=0.3, labelcolor='white',
    facecolor='#111111', edgecolor='#444444')
 
-fig.savefig(f'{ADT_DIR}/sam2_report_f0.png', dpi=130,
+fig.savefig(f'{ADT_DIR}/sam2_report_f{FRAME_IDX}.png', dpi=130,
             bbox_inches='tight', facecolor='#111111')
 plt.close()
-print(f"  Saved sam2_report_f0.png")
+print(f"  Saved sam2_report_f{FRAME_IDX}.png")
 
 print("\nDone. All outputs written to:", ADT_DIR)
