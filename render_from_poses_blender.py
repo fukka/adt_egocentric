@@ -5,14 +5,39 @@ Drives blender_render_scene.py for each frame:
   1. Reads ADT ground truth object 6DoF poses and camera trajectory
   2. Exports per-frame JSON (camera pose + object GLB paths + T_WO)
   3. Calls Blender headless to render each frame
+Output labels:
+  • Instance segmentation map  (object UIDs as int64 .npy + colorised PNG)
+  • Surface normal map         (world-space XYZ float32 .npy + visualised PNG)
+  • Depth map                  (camera-space distance float32 .npy + visualised PNG)
 
 Usage:
-    python render_from_poses_blender.py [--num_frames N] [--frame_step K]
-                                        [--output_size S] [--focal F]
+    python render_from_poses_blender.py \
+     [--num_frames N] [--frame_step K] \
+     [--output_size S] [--focal F] \
+     [--fisheye] \
+     [--no_segmentation] [--no_normals] [--no_depth] \
+     [--output_dir /path/to/output]
+
+
+Normal map convention:
+    Camera-space surface normals in OpenCV convention (+X right, +Y down, +Z forward).
+    Saved as float32 (H, W, 3) in XYZ order, unit-length.
+    Z < 0 for surfaces facing the camera (toward-camera convention, standard for
+    depth estimation benchmarks).  Background pixels are stored as (0, 0, 0).
+    Derived from Blender's world-space Normal pass, rotated into camera space via
+    R_CW = T_WC[:3,:3].T, then Y and Z are negated to convert from Blender camera
+    convention (+Y up, −Z forward) to OpenCV convention (+Y down, +Z forward).
+
+Depth map convention:
+    Camera-space distance in metres (Blender Z pass = distance from camera
+    origin to surface along the ray, not projected Z).
+    Background pixels = np.inf (no surface hit).
+    Saved as float32 (H, W); clip to a finite max when loading for visualisation.
 """
 
 import sys, os, csv, json, argparse, subprocess
-sys.path.insert(0, '/sessions/dreamy-modest-brown/.local/lib/python3.10/site-packages')
+# sys.path.insert(0, '/sessions/dreamy-modest-brown/.local/lib/python3.10/site-packages')
+sys.path.insert(0, '/user/f.zhang2/.local/lib/python3.10/site-packages')
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -24,45 +49,15 @@ from projectaria_tools.core import data_provider
 from projectaria_tools.core.stream_id import StreamId
 
 # ── Paths ──────────────────────────────────────────────────────────────────
-BASE        = '/sessions/dreamy-modest-brown/mnt/ADT/Apartment_release_golden_skeleton_seq100_10s_sample_M1292'
-EGO_VRS     = f'{BASE}/main_recording.vrs'
-GT_DIR      = f'{BASE}/groundtruth'
+BASE        = '/user/f.zhang2/Documents/projectaria_tools_adt_data/Apartment_release_golden_skeleton_seq100_10s_sample_M1292'
+EGO_VRS     = f'{BASE}/video.vrs'
+GT_DIR      = f'{BASE}'
 MODELS_DIR  = f'{BASE}/object_models'
-BLENDER_BIN = '/sessions/dreamy-modest-brown/blender/blender'
-BLEND_SCRIPT= '/sessions/dreamy-modest-brown/mnt/ADT/blender_render_scene.py'
+BLENDER_BIN = '/user/f.zhang2/blender/blender'
+BLEND_SCRIPT= '/user/f.zhang2/projects/adt_egocentric/blender_render_scene.py'
 RGB_STREAM  = StreamId('214-1')
 
 FLIP_YZ = np.diag([1.0, -1.0, -1.0, 1.0])
-
-# ── Object rotation convention fix ─────────────────────────────────────────
-# ADT T_WO encodes the transform from the object's CANONICAL frame to world.
-# Each object's canonical frame is documented in instances.json:
-#   "canonical_pose": {"up_vector": [0,1,0], "front_vector": [0,0,1]}
-# i.e. ADT expects canonical local +Y = "up face" and canonical local +Z = "front".
-#
-# GLB models are exported in glTF 2.0 convention (Y-up, +Z toward viewer).
-# When Blender imports a GLB it converts vertex positions from glTF space to
-# Blender's native space by applying R_x(+90°):
-#   vertex_blender = R_x(+90°) @ vertex_gltf_authored
-# This is the only vertex-level transform Blender bakes; any root-node TRS
-# (nodes[0].rotation = R_baked in the glTF JSON) is stored as the object's
-# matrix_local and is NOT baked into vertex positions.
-#
-# When our pipeline overrides matrix_world = T_WO @ R_corr, Blender discards
-# the stored matrix_local (i.e. R_baked is lost).  The vertices remain as
-# R_x(+90°) @ vertex_gltf_authored.
-#
-# For vertex_world = T_WO @ vertex_canonical:
-#   T_WO @ R_corr @ R_x(+90°) @ vertex_gltf_authored = T_WO @ R_baked @ vertex_gltf_authored
-#   => R_corr = R_baked @ R_x(+90°)^{-1} = R_baked @ R_x(-90°)
-#
-# For objects with no baked root rotation, R_baked = I → R_corr = R_x(-90°).
-# For WhiteFlatwareTray (R_baked ≈ R_y(+90°)):
-#   R_corr = R_y(+90°) @ R_x(-90°)
-#   → tray lies flat with long axis along world +Z (front direction) ✓
-#
-# Verified by diagnostic on frame 0: comparing projected tray footprint
-# against GT segmentation confirms R_baked @ R_x(-90°) matches ADT synthetic.
 
 R_x_neg90 = np.array([[1, 0,  0],
                        [0, 0,  1],
@@ -201,9 +196,15 @@ def build_fisheye624_remap(cam_calib, out_w, out_h, eq_w, eq_h):
 
     valid = (r < valid_r_s)
 
+    # Unit ray directions in ADT camera space: used to convert ray-distance
+    # depth (panoramic Z pass) to perpendicular Z depth, and for exact
+    # fisheye back-projection when computing normals from depth.
+    ray_dirs = np.stack([ray_x, ray_y, ray_z],
+                        axis=-1).reshape(out_h, out_w, 3).astype(np.float32)
     return (map_x.reshape(out_h, out_w),
             map_y.reshape(out_h, out_w),
-            valid.reshape(out_h, out_w))
+            valid.reshape(out_h, out_w),
+            ray_dirs)
 
 
 def remap_equirect_to_fisheye(equirect_img, map_x, map_y, valid_mask):
@@ -365,17 +366,18 @@ def build_scene_lights(scene_objects_csv, instances_json_path):
     #   Living/bedroom (X∈[-4,0], Z∈[-4,3]) — sofa, bed, shelves
     # Six 2×2m area lights cover the floor plan.  All at Y=2.35m (just below
     # ceiling).  Warm-white colour ≈ 3000 K (indoor tungsten/LED).
-    CEIL_Y      = 2.35   # metres
-    CEIL_ENERGY = 22.0   # Watts — calibrated to match ADT mean brightness ~66/255
+    CEIL_Y      = 2.5   # metres
+    CEIL_ENERGY = 30.0   # Watts — calibrated to match ADT mean brightness ~66/255
     CEIL_COLOR  = [1.0, 0.90, 0.75]   # warm indoor white
-    CEIL_SIZE   = 1.8    # metres — each tile covers a 1.8×1.8m patch
+    # CEIL_SIZE   = 1.8    # metres — each tile covers a 1.8×1.8m patch
+    CEIL_SIZE = 0.2  # metres — each tile covers a 1.8×1.8m patch
     for (cx, cz) in [
         ( 0.5,  2.5),   # above kitchen counter / WoodenBowl
-        ( 0.5,  0.5),   # kitchen island / entry
-        (-1.0, -1.5),   # living-room sofa area
-        (-1.0,  4.5),   # dining / far kitchen
-        (-2.5, -2.5),   # bedroom / hallway
-        (-2.5,  1.5),   # living centre
+        # ( 0.5,  0.5),   # kitchen island / entry
+        # (-1.0, -1.5),   # living-room sofa area
+        # (-1.0,  4.5),   # dining / far kitchen
+        # (-2.5, -2.5),   # bedroom / hallway
+        # (-2.5,  1.5),   # living centre
     ]:
         lights.append({
             'type':     'AREA',
@@ -383,6 +385,22 @@ def build_scene_lights(scene_objects_csv, instances_json_path):
             'energy':   CEIL_ENERGY,
             'color':    CEIL_COLOR,
             'size':     CEIL_SIZE,
+        })
+
+    CEIL_Y = 2.6  # metres
+    CEIL_ENERGY = 40.0  # Watts — calibrated to match ADT mean brightness ~66/255
+    CEIL_COLOR = [1.0, 0.90, 0.75]  # warm indoor white
+    # CEIL_SIZE   = 1.8    # metres — each tile covers a 1.8×1.8m patch
+    CEIL_SIZE = 2.8  # metres — each tile covers a 1.8×1.8m patch
+    for (cx, cz) in [
+        (0.5, 2.5),  # above kitchen counter / WoodenBowl
+    ]:
+        lights.append({
+            'type': 'AREA',
+            'location': [cx, CEIL_Y, cz],
+            'energy': CEIL_ENERGY,
+            'color': CEIL_COLOR,
+            'size': CEIL_SIZE,
         })
 
     print(f'  Scene lights: {sum(1 for l in lights if l["type"]=="POINT")} prop points + '
@@ -412,7 +430,7 @@ def build_object_list(instances, obj_poses, models_dir):
         glb_path = None
         for candidate in [instance_name, prototype_name]:
             if candidate:
-                p = os.path.join(models_dir, f'{candidate}.glb')
+                p = os.path.join(models_dir, candidate, '3d-asset.glb')
                 if os.path.exists(p):
                     glb_path = p
                     break
@@ -551,9 +569,7 @@ def apply_aria_forward_isp(srgb_img: np.ndarray,
     """
     # Step 1: sRGB → linear (inverse sRGB gamma)
     v = srgb_img.astype(np.float32) / 255.0
-    linear = np.where(v <= 0.04045,
-                      v / 12.92,
-                      ((v + 0.055) / 1.055) ** 2.4)
+    linear = np.where(v <= 0.04045, v / 12.92, ((v + 0.055) / 1.055) ** 2.4)
 
     # Step 2: standard linear → camera linear (inverse CCM)
     H, W, _ = linear.shape
@@ -573,10 +589,8 @@ def apply_aria_forward_isp(srgb_img: np.ndarray,
     if channel_balance is not None:
         cb = np.asarray(channel_balance, dtype=np.float32)
         out_uint8 = np.clip(
-            out_uint8.astype(np.float32) * cb[np.newaxis, np.newaxis, :],
-            0, 255
+            out_uint8.astype(np.float32) * cb[np.newaxis, np.newaxis, :], 0, 255
         ).astype(np.uint8)
-
     return out_uint8
 
 
@@ -592,32 +606,185 @@ def colorize_seg(seg_uid):
     return vis
 
 
+def visualize_normal(normal_xyz: np.ndarray) -> np.ndarray:
+    """Convert float32 (H,W,3) normal map in [-1,1] to uint8 RGB image.
+
+    Maps each component from [-1, +1] → [0, 255].
+    Common convention: positive X/Y/Z → warm/green/blue tones.
+    Invalid/zero normals (black in the input) remain near mid-grey (128).
+    """
+    vis = np.clip((normal_xyz + 1.0) * 0.5 * 255.0, 0, 255).astype(np.uint8)
+    return vis
+
+
+def visualize_depth(depth: np.ndarray,
+                    near: float = 0.1,
+                    far_pct: float = 99.0) -> np.ndarray:
+    """Convert float32 (H,W) depth in metres to uint8 grayscale image.
+
+    Uses log-scale normalisation between `near` and the `far_pct`-th
+    percentile of finite depths, so highlights near-object details.
+    Invalid (inf/nan) pixels are rendered as black.
+    """
+    valid = np.isfinite(depth) & (depth > near)
+    if valid.sum() == 0:
+        return np.zeros(depth.shape, dtype=np.uint8)
+    far = float(np.percentile(depth[valid], far_pct))
+    d_clip = np.clip(depth, near, far)
+    log_d  = np.log(d_clip)
+    log_near, log_far = np.log(near), np.log(far)
+    norm   = (log_d - log_near) / (log_far - log_near + 1e-9)
+    norm   = np.clip(norm, 0.0, 1.0)
+    vis    = (norm * 255.0).astype(np.uint8)
+    vis[~valid] = 0   # black for background
+    return vis
+
+
+def _normals_from_depth_fisheye(depth: np.ndarray,
+                                ray_dirs: np.ndarray,
+                                valid_mask: np.ndarray) -> np.ndarray:
+    """
+    Compute surface normals from a fisheye depth map (perpendicular Z depth).
+
+    Back-projects each pixel to 3D using the pre-computed unit ray directions,
+    then estimates normals via central-difference cross-products.  The result
+    is guaranteed consistent with depth_to_normals() if the same depth is
+    passed — the only difference is that the fisheye ray directions give exact
+    back-projection at wide angles instead of the pinhole approximation.
+
+    depth      : (H, W) float32 — perpendicular Z depth in metres (inf/nan = bg)
+    ray_dirs   : (H, W, 3) float32 — unit ray directions in ADT camera space
+                 (+X right, +Y down, +Z forward); ray_z = cos(incident_angle)
+    valid_mask : (H, W) bool — pixels inside the fisheye circle
+
+    Returns (H, W, 3) float32 unit normals in ADT camera space.
+    Z < 0 for camera-facing surfaces; invalid pixels are NaN.
+    """
+    ray_z = ray_dirs[..., 2].astype(np.float64)   # cos(theta), shape (H, W)
+    d = depth.astype(np.float64)
+    bad = (~np.isfinite(d)) | (d <= 0) | (~valid_mask) | (ray_z < 1e-4)
+
+    # 3D point: P = ray_dist * ray_dir  where ray_dist = Z_perp / cos(theta)
+    ray_z_safe = np.where(bad, 1.0, ray_z)
+    ray_dist = np.where(bad, np.nan, d / ray_z_safe)
+
+    P = ray_dist[..., None] * ray_dirs.astype(np.float64)   # (H, W, 3)
+    P[bad] = np.nan
+
+    dPu = np.full_like(P, np.nan)
+    dPv = np.full_like(P, np.nan)
+    dPu[:, 1:-1] = P[:, 2:] - P[:, :-2]   # right − left
+    dPv[1:-1, :] = P[2:, :] - P[:-2, :]   # below − above
+
+    normals = np.cross(dPu, dPv)           # (H, W, 3); initially Z > 0
+    flip = normals[..., 2] > 0
+    normals[flip] *= -1                    # flip to Z < 0 (toward-camera convention)
+
+    norms = np.linalg.norm(normals, axis=-1, keepdims=True)
+    valid = (norms[..., 0] > 1e-8) & np.isfinite(norms[..., 0])
+    normals = np.where(valid[..., None], normals / (norms + 1e-8), np.nan)
+    return normals.astype(np.float32)
+
+
+def _normals_from_depth_pinhole(depth: np.ndarray,
+                                fx: float, fy: float,
+                                cx: float, cy: float) -> np.ndarray:
+    """
+    Compute surface normals from a pinhole depth map (perpendicular Z depth).
+
+    Identical protocol to depth_to_normals() in eval_utils.py so that the
+    saved normal map exactly matches applying that function to the saved depth.
+
+    depth  : (H, W) float32 — perpendicular Z depth in metres; inf/nan = bg
+    fx, fy : focal lengths in pixels
+    cx, cy : principal point in pixels
+
+    Returns (H, W, 3) float32 unit normals in ADT camera space.
+    Z < 0 for camera-facing surfaces; invalid pixels are NaN.
+    """
+    H, W = depth.shape
+    u = np.arange(W, dtype=np.float64)
+    v = np.arange(H, dtype=np.float64)
+    uu, vv = np.meshgrid(u, v)
+    d = depth.astype(np.float64)
+
+    X = (uu - cx) * d / fx
+    Y = (vv - cy) * d / fy
+    Z = d.copy()
+    bad = ~np.isfinite(d) | (d <= 0)
+    X[bad] = np.nan
+    Y[bad] = np.nan
+    Z[bad] = np.nan
+
+    P = np.stack([X, Y, Z], axis=-1)      # (H, W, 3)
+
+    dPu = np.full_like(P, np.nan)
+    dPv = np.full_like(P, np.nan)
+    dPu[:, 1:-1] = P[:, 2:] - P[:, :-2]
+    dPv[1:-1, :] = P[2:, :] - P[:-2, :]
+
+    normals = np.cross(dPu, dPv)
+    flip = normals[..., 2] > 0
+    normals[flip] *= -1
+
+    norms = np.linalg.norm(normals, axis=-1, keepdims=True)
+    valid = (norms[..., 0] > 1e-8) & np.isfinite(norms[..., 0])
+    normals = np.where(valid[..., None], normals / (norms + 1e-8), np.nan)
+    return normals.astype(np.float32)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--num_frames',  type=int,   default=None)
+    parser.add_argument('--num_frames',  type=int,   default=1)
     parser.add_argument('--frame_step',  type=int,   default=30,
                         help='Render every Nth frame (default: 30 = ~1fps)')
-    parser.add_argument('--output_size', type=int,   default=512)
+    parser.add_argument('--output_size', type=int,   default=1408)
     # ADT camera-rgb: 611px focal at 1408px. Scaled to output_size: 611*(S/1408)
     parser.add_argument('--focal',       type=float, default=None,
                         help='Focal length in pixels at output_size. '
-                             'Default: scale from ADT calibration (611@1408)')
+                             'Default: scaled from ADT calibration (611@1408)')
     parser.add_argument('--output_dir',  type=str,
-                        default=f'{BASE}/blender_rendered')
+                        default=f'{BASE}/blender_rendered_maps')
     parser.add_argument('--fisheye',     action='store_true',
                         help='Render equirectangular panorama and remap to '
                              'Aria FISHEYE624 projection (exact lens match)')
+    # Auxiliary map toggles (all on by default; use --no_* to disable)
     parser.add_argument('--no_segmentation', action='store_true',
-                        help='Skip instance segmentation output (pass this flag '
-                             'if blender_render_scene.py does not support '
-                             '--seg_output, e.g. older versions of the script)')
+                        help='Skip instance segmentation output')
+    parser.add_argument('--no_normals',      action='store_true',
+                        help='Skip surface normal map output')
+    parser.add_argument('--blender_normals', action='store_true',
+                        help='Save normals from Blender\'s Normal render pass (world → '
+                             'ADT camera space via R_CW), instead of the default which '
+                             'computes normals from the depth map via back-projection. '
+                             'Useful for debugging; not guaranteed consistent with '
+                             'depth_to_normals() at wide fisheye angles.')
+    parser.add_argument('--no_depth',        action='store_true',
+                        help='Skip depth map output')
+    parser.add_argument('--equirect_scale', type=int, default=6,
+                        help='Equirect width = output_size × this.')
     args = parser.parse_args()
     args.segmentation = not args.no_segmentation
+    args.normals      = not args.no_normals
+    args.depth        = not args.no_depth
 
-    os.makedirs(f'{args.output_dir}/rgb',          exist_ok=True)
-    os.makedirs(f'{args.output_dir}/comparison',   exist_ok=True)
-    if args.segmentation:
-        os.makedirs(f'{args.output_dir}/segmentation', exist_ok=True)
+    if args.fisheye:
+        os.makedirs(f'{args.output_dir}/equirect', exist_ok=True)
+        os.makedirs(f'{args.output_dir}/fisheye', exist_ok=True)
+        if args.segmentation:
+            os.makedirs(f'{args.output_dir}/fisheye/segmentation', exist_ok=True)
+        if args.normals:
+            os.makedirs(f'{args.output_dir}/fisheye/normal_maps', exist_ok=True)
+        if args.depth:
+            os.makedirs(f'{args.output_dir}/fisheye/depth_maps', exist_ok=True)
+    else:
+        os.makedirs(f'{args.output_dir}/pinhole', exist_ok=True)
+        if args.segmentation:
+            os.makedirs(f'{args.output_dir}/pinhole/segmentation', exist_ok=True)
+        if args.normals:
+            os.makedirs(f'{args.output_dir}/pinhole/normal_maps', exist_ok=True)
+        if args.depth:
+            os.makedirs(f'{args.output_dir}/pinhole/depth_maps', exist_ok=True)
     tmp_dir = f'{args.output_dir}/_tmp'
     os.makedirs(tmp_dir, exist_ok=True)
 
@@ -638,34 +805,36 @@ def main():
 
     # Precompute fisheye remap if requested
     fisheye_remap = None
-    # Equirect resolution: 2× the output size per axis gives good quality
-    # while keeping Blender render time within the subprocess timeout.
-    # (4× resolution is nicer but takes ~4× longer; 2× is a good trade-off.)
-    EQ_W = max(1024, args.output_size * 2)   # equirect width  ≥ 1024
+    EQ_W = args.output_size * args.equirect_scale
     EQ_H = EQ_W // 2                          # equirect height = EQ_W / 2
     if args.fisheye:
-        remap_cache = f'{args.output_dir}/_remap_{args.output_size}.npz'
+        remap_cache = f'{args.output_dir}/fisheye/_remap_{args.output_size}.npz'
+        need_recompute = True
         if os.path.exists(remap_cache):
-            print('  Loading cached fisheye remap map…')
             d = np.load(remap_cache)
-            fisheye_remap = (d['map_x'], d['map_y'], d['valid'])
-        else:
+            if 'ray_dirs' in d:
+                print('  Loading cached fisheye remap map…')
+                fisheye_remap = (d['map_x'], d['map_y'], d['valid'], d['ray_dirs'])
+                need_recompute = False
+            else:
+                print('  Cached remap missing ray_dirs — recomputing…')
+        if need_recompute:
             print(f'  Precomputing FISHEYE624 remap '
                   f'({args.output_size}×{args.output_size} → {EQ_W}×{EQ_H})…')
-            map_x, map_y, valid = build_fisheye624_remap(
+            map_x, map_y, valid, ray_dirs = build_fisheye624_remap(
                 cam_calib_rgb, args.output_size, args.output_size, EQ_W, EQ_H)
-            np.savez_compressed(remap_cache, map_x=map_x, map_y=map_y, valid=valid)
-            fisheye_remap = (map_x, map_y, valid)
+            np.savez_compressed(remap_cache, map_x=map_x, map_y=map_y,
+                                valid=valid, ray_dirs=ray_dirs)
+            fisheye_remap = (map_x, map_y, valid, ray_dirs)
             print(f'    Done. {valid.sum()} valid pixels '
                   f'({100*valid.mean():.1f}% of image)')
-        os.makedirs(f'{args.output_dir}/fisheye', exist_ok=True)
 
     with open(f'{GT_DIR}/instances.json') as f:
         instances = json.load(f)
     traj, ts_arr  = load_trajectory(f'{GT_DIR}/aria_trajectory.csv')
     static_poses, dynamic_poses = load_all_object_poses(f'{GT_DIR}/scene_objects.csv')
 
-    print('Building scene lights from prop positions + ceiling grid...')
+    print('Building scene lights...')
     scene_lights = build_scene_lights(f'{GT_DIR}/scene_objects.csv',
                                       f'{GT_DIR}/instances.json')
 
@@ -678,11 +847,31 @@ def main():
     if args.num_frames is not None:
         frames_idx = frames_idx[:args.num_frames]
     print(f'  Rendering {len(frames_idx)} frames (step={args.frame_step})')
+    print(f'  Outputs: rgb | comparison'
+          f'{" | segmentation" if args.segmentation else ""}'
+          f'{" | normal_maps"  if args.normals      else ""}'
+          f'{" | depth_maps"   if args.depth        else ""}')
 
     for count, idx in enumerate(frames_idx):
-        out_png = f'{args.output_dir}/rgb/frame_{idx:04d}.png'
+        if args.fisheye:
+            eq_out_png = f'{args.output_dir}/equirect/frame_{idx:04d}.png'
+            out_png = f'{args.output_dir}/fisheye/frame_{idx:04d}.png'
+            seg_npy_out = f'{args.output_dir}/fisheye/segmentation/frame_{idx:04d}.npy'
+            seg_vis_out = f'{args.output_dir}/fisheye/segmentation/frame_{idx:04d}_vis.png'
+            norm_npy_out = f'{args.output_dir}/fisheye/normal_maps/frame_{idx:04d}.npy'
+            norm_vis_out = f'{args.output_dir}/fisheye/normal_maps/frame_{idx:04d}_vis.png'
+            depth_npy_out = f'{args.output_dir}/fisheye/depth_maps/frame_{idx:04d}.npy'
+            depth_vis_out = f'{args.output_dir}/fisheye/depth_maps/frame_{idx:04d}_vis.png'
+        else:
+            out_png = f'{args.output_dir}/pinhole/frame_{idx:04d}.png'
+            seg_npy_out = f'{args.output_dir}/pinhole/segmentation/frame_{idx:04d}.npy'
+            seg_vis_out = f'{args.output_dir}/pinhole/segmentation/frame_{idx:04d}_vis.png'
+            norm_npy_out = f'{args.output_dir}/pinhole/normal_maps/frame_{idx:04d}.npy'
+            norm_vis_out = f'{args.output_dir}/pinhole/normal_maps/frame_{idx:04d}_vis.png'
+            depth_npy_out = f'{args.output_dir}/pinhole/depth_maps/frame_{idx:04d}.npy'
+            depth_vis_out = f'{args.output_dir}/pinhole/depth_maps/frame_{idx:04d}_vis.png'
         if os.path.exists(out_png):
-            print(f'  [{count+1}/{len(frames_idx)}] frame {idx:04d} already exists, skipping')
+            print(f'  [{count+1}/{len(frames_idx)}] frame {idx:04d} already exists, skipping ({out_png})')
             continue
 
         # Get ego RGB for comparison
@@ -712,11 +901,12 @@ def main():
             for obj in all_objects
         ]
         objs_with_dist.sort(key=lambda x: x[0])
-        visible_objects = [obj for _, obj in objs_with_dist[:80]]
-        n_dyn = sum(1 for _, obj in objs_with_dist[:80]
+        visible_objects = [obj for _, obj in objs_with_dist]
+        n_dyn = sum(1 for _, obj in objs_with_dist
                     if any(obj is o for o in dyn_object_list))
         print(f'    Distance-culled to {len(visible_objects)} objects '
-              f'({n_dyn} dynamic, max dist: {objs_with_dist[min(79,len(objs_with_dist)-1)][0]:.1f}m)')
+              f'({n_dyn} dynamic, '
+              f'max dist: {objs_with_dist[len(objs_with_dist)-1][0]:.1f}m)')
 
         # Assign sequential pass_index values (1-based; 0 = background) for seg mask
         pass_idx_to_uid: dict[int, int] = {}
@@ -729,34 +919,30 @@ def main():
 
         # Write per-frame JSON
         frame_data = {
-            'image_width':    args.output_size,
-            'image_height':   args.output_size,
-            'focal_px':       args.focal,
-            'camera_pose':    T_WC.flatten().tolist(),
-            'object_models':  visible_objects,
-            'scene_lights':   scene_lights,
-            'use_equirect':   args.fisheye,
+            'image_width':     args.output_size,
+            'image_height':    args.output_size,
+            'focal_px':        args.focal,
+            'camera_pose':     T_WC.flatten().tolist(),
+            'object_models':   visible_objects,
+            'scene_lights':    scene_lights,
+            'use_equirect':    args.fisheye,
             'equirect_width':  EQ_W if args.fisheye else args.output_size,
             'equirect_height': EQ_H if args.fisheye else args.output_size,
-            # Equirect renders downsample via remap → fewer samples still look good
-            'cycles_samples':  16 if args.fisheye else 32,
+            'cycles_samples':  32,
             'pass_idx_to_uid': {str(k): v for k, v in pass_idx_to_uid.items()},
         }
         json_path = f'{tmp_dir}/frame_{idx:04d}.json'
         with open(json_path, 'w') as f:
             json.dump(frame_data, f)
 
-        # In fisheye mode Blender renders equirect at EQ_W×EQ_H then we remap.
-        # Use a temp path for the Blender output so we don't overwrite out_png.
         if args.fisheye:
-            blender_out = f'{tmp_dir}/equirect_{idx:04d}.png'
+            blender_out = eq_out_png
         else:
             blender_out = out_png
-
         # Segmentation EXR path (inside tmp; renamed to final location after render)
-        seg_exr_tmp  = f'{tmp_dir}/seg_{idx:04d}.exr'
-        seg_npy_out  = f'{args.output_dir}/segmentation/frame_{idx:04d}.npy'
-        seg_vis_out  = f'{args.output_dir}/segmentation/frame_{idx:04d}_vis.png'
+        seg_exr_tmp    = f'{tmp_dir}/seg_{idx:04d}.exr'
+        normal_exr_tmp = f'{tmp_dir}/normal_{idx:04d}.exr'
+        depth_exr_tmp  = f'{tmp_dir}/depth_{idx:04d}.exr'
 
         # Call Blender
         print(f'  [{count+1}/{len(frames_idx)}] Rendering frame {idx:04d}...')
@@ -766,6 +952,15 @@ def main():
         ]
         if args.segmentation:
             cmd += ['--seg_output', seg_exr_tmp]
+        # Normal EXR from Blender only needed for --blender_normals debug mode;
+        # default normals are computed from the depth map instead.
+        if args.normals and args.blender_normals:
+            cmd += ['--normal_output', normal_exr_tmp]
+        # Depth EXR is needed whenever depth is saved OR normals are computed
+        # from depth (the default when --blender_normals is not set).
+        if args.depth or (args.normals and not args.blender_normals):
+            cmd += ['--depth_output',  depth_exr_tmp]
+
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         # Blender can return non-zero exit codes on import warnings while still
         # writing the output file successfully. Check the file before bailing.
@@ -780,27 +975,22 @@ def main():
         # Fisheye remap: equirect → FISHEYE624 projection
         if args.fisheye and fisheye_remap is not None:
             eq_img   = Image.open(blender_out)
-            map_x, map_y, valid = fisheye_remap
+            map_x, map_y, valid, _ = fisheye_remap
             fish_arr = remap_equirect_to_fisheye(eq_img, map_x, map_y, valid)
             # Apply Aria Gen1 forward ISP so colours match ADT synthetic images
             fish_arr = apply_aria_forward_isp(fish_arr)
             Image.fromarray(fish_arr).save(out_png)
-            # Also save full fisheye copy in dedicated folder
-            Image.fromarray(fish_arr).save(
-                f'{args.output_dir}/fisheye/frame_{idx:04d}.png')
             render_img = fish_arr
         else:
-            raw_render = np.array(Image.open(out_png).convert('RGB'))
-            # Apply Aria Gen1 forward ISP so colours match ADT synthetic images
-            render_img = apply_aria_forward_isp(raw_render)
+            render_img = np.array(Image.open(blender_out).convert('RGB'))
+            render_img = apply_aria_forward_isp(render_img)
             Image.fromarray(render_img).save(out_png)
 
         # ── Segmentation post-processing ────────────────────────────────────
         if args.segmentation:
             if os.path.exists(seg_exr_tmp):
                 # Load float32 EXR (RGB; IndexOB value is broadcast to R=G=B channels)
-                seg_raw3  = cv2.imread(seg_exr_tmp,
-                                       cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
+                seg_raw3  = cv2.imread(seg_exr_tmp, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
                 seg_float = seg_raw3[..., 0] if seg_raw3 is not None else None  # R channel
                 if seg_float is None:
                     print(f'    [seg] cv2 could not read {seg_exr_tmp}; skipping seg')
@@ -808,7 +998,7 @@ def main():
                     if args.fisheye and fisheye_remap is not None:
                         # Remap equirect seg → fisheye using nearest-neighbour
                         # (must NOT interpolate class IDs)
-                        map_x_s, map_y_s, valid_s = fisheye_remap
+                        map_x_s, map_y_s, valid_s, _ = fisheye_remap
                         seg_float = cv2.remap(seg_float, map_x_s, map_y_s,
                                               interpolation=cv2.INTER_NEAREST,
                                               borderMode=cv2.BORDER_CONSTANT,
@@ -821,23 +1011,147 @@ def main():
                     for pidx_s, uid_s in pass_idx_to_uid.items():
                         seg_uid[pass_arr == pidx_s] = uid_s
 
-                    # Rotate to display orientation (same rot90 CW as RGB frames)
-                    seg_uid = np.rot90(seg_uid, k=-1).copy()
+                    # # Rotate to display orientation (same rot90 CW as RGB frames)
+                    # seg_uid = np.rot90(seg_uid, k=-1).copy()
 
                     # Save NPY (int64 instance UIDs) + colourised PNG
                     np.save(seg_npy_out, seg_uid)
                     Image.fromarray(colorize_seg(seg_uid)).save(seg_vis_out)
                     n_objs = len(np.unique(seg_uid)) - 1   # exclude background
                     print(f'    Segmentation: {n_objs} objects → {seg_npy_out}')
-            else:
+            elif args.segmentation:
                 print(f'    [seg] EXR not found at {seg_exr_tmp}')
 
+        # ── Depth map post-processing ─────────────────────────────────────
+        # Blender Z pass broadcast to RGB EXR.  Read R channel for depth.
+        #
+        # Perspective camera: Z pass = camera Z coordinate (perpendicular depth).
+        # Panoramic camera:   Z pass = ray distance (distance along each ray).
+        #   → Converted here to perpendicular Z depth by multiplying by
+        #     cos(incident_angle) = ray_dirs[...,2], so that depth_to_normals()
+        #     (pinhole back-projection) yields correct 3D points.
+        #
+        # Background / sky pixels have values ~1e10; replaced with np.inf.
+        # depth_for_normals is shared with the normal block below.
+        depth_for_normals = None
+        if args.depth or (args.normals and not args.blender_normals):
+            if os.path.exists(depth_exr_tmp):
+                depth_bgr = cv2.imread(depth_exr_tmp,
+                                       cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
+                if depth_bgr is None:
+                    print(f'    [depth] cv2 could not read {depth_exr_tmp}; skipping')
+                else:
+                    depth = depth_bgr[..., 0].astype(np.float32)  # R channel
+                    depth[depth > 1e6] = np.inf
+
+                    if args.fisheye and fisheye_remap is not None:
+                        map_x_d, map_y_d, valid_d, ray_dirs_d = fisheye_remap
+                        depth = cv2.remap(depth, map_x_d, map_y_d,
+                                          interpolation=cv2.INTER_LINEAR,
+                                          borderMode=cv2.BORDER_CONSTANT,
+                                          borderValue=np.inf)
+                        depth[~valid_d] = np.inf
+                        # Convert panoramic ray-distance → perpendicular Z depth so
+                        # depth_to_normals() (pinhole model) gives correct 3D points.
+                        # Z_perp = ray_dist * cos(theta) = ray_dist * ray_dirs[...,2]
+                        inf_mask = ~np.isfinite(depth)
+                        depth = depth * ray_dirs_d[..., 2]
+                        depth[inf_mask] = np.inf
+
+                    depth_for_normals = depth
+
+                    if args.depth:
+                        np.save(depth_npy_out, depth)
+                        Image.fromarray(visualize_depth(depth)).save(depth_vis_out)
+                        finite_cnt = np.isfinite(depth).sum()
+                        median_d   = float(np.nanmedian(depth[np.isfinite(depth)])) \
+                                     if finite_cnt > 0 else 0.0
+                        print(f'    Depth map saved → {depth_npy_out}  '
+                              f'(median {median_d:.2f}m, {finite_cnt} valid px)')
+            elif args.depth:
+                print(f'    [depth] EXR not found at {depth_exr_tmp}')
+
+        # ── Normal map post-processing ────────────────────────────────────
+        # Default: compute camera-space normals directly from the depth map via
+        # back-projection and central-difference cross-products — the same
+        # protocol as depth_to_normals() in eval_utils.py.  This guarantees
+        # that saved normals are exactly consistent with the saved depth.
+        #
+        #   Fisheye: back-project using per-pixel fisheye ray directions for
+        #   geometrically accurate normals at wide angles.
+        #   Pinhole: standard (u−cx, v−cy, fx) back-projection, identical to
+        #   depth_to_normals().
+        #
+        # --blender_normals (debug):
+        #   Load Blender's Normal render pass (world-space, ADT Y-up), rotate
+        #   to ADT camera space via R_CW = T_WC[:3,:3].T.  Remap to fisheye if
+        #   needed.  Not guaranteed consistent with depth_to_normals() at wide
+        #   angles because Blender computes per-triangle normals, while
+        #   depth_to_normals() differentiates the rasterised depth.
+        if args.normals:
+            norm_out = None
+
+            if args.blender_normals:
+                # ── Blender Normal pass (debug) ───────────────────────────
+                if os.path.exists(normal_exr_tmp):
+                    norm_bgr = cv2.imread(normal_exr_tmp,
+                                          cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
+                    if norm_bgr is None:
+                        print(f'    [normal] cv2 could not read {normal_exr_tmp}')
+                    else:
+                        # BGR → XYZ (Blender Cycles world-space = ADT world space)
+                        norm_world = norm_bgr[..., ::-1].copy()
+                        # World → ADT OpenCV camera space
+                        R_CW = T_WC[:3, :3].T
+                        norm_out = (norm_world.reshape(-1, 3) @ R_CW.T
+                                    ).reshape(norm_world.shape).astype(np.float32)
+
+                        if args.fisheye and fisheye_remap is not None:
+                            map_x_n, map_y_n, valid_n, _ = fisheye_remap
+                            remapped = np.stack([
+                                cv2.remap(norm_out[..., c], map_x_n, map_y_n,
+                                          interpolation=cv2.INTER_LINEAR,
+                                          borderMode=cv2.BORDER_CONSTANT,
+                                          borderValue=0.0)
+                                for c in range(3)
+                            ], axis=-1)
+                            remapped[~valid_n] = 0.0
+                            norms = np.linalg.norm(remapped, axis=-1, keepdims=True)
+                            norm_out = np.where(norms > 1e-4,
+                                                remapped / (norms + 1e-8),
+                                                0.0).astype(np.float32)
+                else:
+                    print(f'    [normal] EXR not found at {normal_exr_tmp}')
+
+            else:
+                # ── Depth-derived normals (default) ──────────────────────
+                if depth_for_normals is not None:
+                    if args.fisheye and fisheye_remap is not None:
+                        _, _, valid_n, ray_dirs_n = fisheye_remap
+                        norm_out = _normals_from_depth_fisheye(
+                            depth_for_normals, ray_dirs_n, valid_n)
+                    else:
+                        cx_n = args.output_size / 2.0
+                        cy_n = args.output_size / 2.0
+                        norm_out = _normals_from_depth_pinhole(
+                            depth_for_normals,
+                            args.focal, args.focal, cx_n, cy_n)
+                else:
+                    print(f'    [normal] depth not available — skipping normals')
+
+            if norm_out is not None:
+                np.save(norm_npy_out, norm_out)
+                Image.fromarray(
+                    visualize_normal(np.nan_to_num(norm_out, nan=0.0))
+                ).save(norm_vis_out)
+                print(f'    Normal map saved → {norm_npy_out}')
+
         # Side-by-side: ego (resized) | blender render
-        ego_img = np.array(Image.fromarray(ego_rgb).resize(
-                      (args.output_size, args.output_size), Image.LANCZOS))
-        gap     = np.ones((args.output_size, 4, 3), dtype=np.uint8) * 40
-        side    = np.concatenate([ego_img, gap, render_img], axis=1)
-        Image.fromarray(side).save(f'{args.output_dir}/comparison/frame_{idx:04d}.png')
+        # ego_img = np.array(Image.fromarray(ego_rgb).resize(
+        #               (args.output_size, args.output_size), Image.LANCZOS))
+        # gap     = np.ones((args.output_size, 4, 3), dtype=np.uint8) * 40
+        # side    = np.concatenate([ego_img, gap, render_img], axis=1)
+        # Image.fromarray(side).save(f'{args.output_dir}/comparison/frame_{idx:04d}.png')
         print(f'    Done.')
 
     print(f'\nAll done! Outputs in {args.output_dir}/')
@@ -845,3 +1159,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

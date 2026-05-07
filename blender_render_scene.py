@@ -27,6 +27,9 @@ Normal output (--normal_output):
   from OpenCV means B=Z, G=Y, R=X — flip channels to get (X,Y,Z).
   Rendered from the opaque-override ViewLayer (same as segmentation) so
   glass/transparent surfaces are always solid — no dotty dropout pattern.
+  NOTE: render_from_poses_blender.py requests this only for --blender_normals
+  (debug mode). The default normal map is computed from the depth map instead,
+  which guarantees consistency with depth_to_normals() in eval_utils.py.
 
 Depth output (--depth_output):
   Camera-space distance (Z pass) written as float32 RGB EXR (depth value
