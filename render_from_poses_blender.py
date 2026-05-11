@@ -888,6 +888,27 @@ def main():
     traj, ts_arr  = load_trajectory(f'{GT_DIR_RESOLVED}/aria_trajectory.csv')
     static_poses, dynamic_poses = load_all_object_poses(f'{GT_DIR_RESOLVED}/scene_objects.csv')
 
+    # ── Timestamp sanity check ─────────────────────────────────────────────
+    # VRS capture timestamps and trajectory timestamps must be in the same
+    # reference frame (both device-time microseconds).  A large mismatch means
+    # poses will always snap to the first/last trajectory entry → wrong camera.
+    _img0    = p_ego.get_image_data_by_index(RGB_STREAM, 0)
+    _ts0_ns  = _img0[1].capture_timestamp_ns
+    _ts0_us  = _ts0_ns // 1000
+    _traj_t0 = int(ts_arr[0])
+    _traj_t1 = int(ts_arr[-1])
+    _delta   = abs(_ts0_us - _traj_t0)
+    print(f'  Trajectory path : {GT_DIR_RESOLVED}/aria_trajectory.csv')
+    print(f'  Trajectory range: {_traj_t0} … {_traj_t1} us')
+    print(f'  VRS frame-0 ts  : {_ts0_us} us  (ns={_ts0_ns})')
+    print(f'  Δ(frame0 - traj_start): {_delta:,} us  '
+          f'({"OK" if _delta < 10_000_000 else "WARNING — large mismatch, possible UTC vs device-time issue"})')
+    # Also show T_DC so we can verify calibration
+    _fwd_dc = T_DC[:3, 2]
+    _pos_dc = T_DC[:3, 3]
+    print(f'  T_DC pos (cam in device): ({_pos_dc[0]:.4f}, {_pos_dc[1]:.4f}, {_pos_dc[2]:.4f}) m')
+    print(f'  T_DC fwd (+Z_cam in dev): ({_fwd_dc[0]:.4f}, {_fwd_dc[1]:.4f}, {_fwd_dc[2]:.4f})')
+
     print('Building scene lights...')
     scene_lights = build_scene_lights(f'{GT_DIR_RESOLVED}/scene_objects.csv',
                                       f'{GT_DIR_RESOLVED}/instances.json')
@@ -1216,12 +1237,17 @@ def main():
                 ).save(norm_vis_out)
                 print(f'    Normal map saved → {norm_npy_out}')
 
-        # Side-by-side: ego (resized) | blender render
-        # ego_img = np.array(Image.fromarray(ego_rgb).resize(
-        #               (args.output_size, args.output_size), Image.LANCZOS))
-        # gap     = np.ones((args.output_size, 4, 3), dtype=np.uint8) * 40
-        # side    = np.concatenate([ego_img, gap, render_img], axis=1)
-        # Image.fromarray(side).save(f'{args.output_dir}/comparison/{frame_stem}.png')
+        # Side-by-side comparison: real ego fisheye | blender render
+        # Resize real image to output_size × output_size for visual comparison.
+        os.makedirs(f'{args.output_dir}/comparison', exist_ok=True)
+        ego_resized = np.array(
+            Image.fromarray(ego_rgb).resize(
+                (args.output_size, args.output_size), Image.LANCZOS))
+        gap  = np.ones((args.output_size, 8, 3), dtype=np.uint8) * 60
+        side = np.concatenate([ego_resized, gap, render_img], axis=1)
+        cmp_path = f'{args.output_dir}/comparison/{frame_stem}.png'
+        Image.fromarray(side).save(cmp_path)
+        print(f'    Comparison saved → {cmp_path}')
         print(f'    Done.')
 
     print(f'\nAll done! Outputs in {args.output_dir}/')
