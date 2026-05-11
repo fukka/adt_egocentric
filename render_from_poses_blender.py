@@ -12,7 +12,7 @@ Output labels:
 
 Usage:
     python render_from_poses_blender.py \
-     [--num_frames N] [--frame_step K] \
+     [--start_frame N] [--end_frame N] [--frame_step K] [--fast_render] \
      [--output_size S] [--focal F] \
      [--fisheye] \
      [--no_segmentation] [--no_normals] [--no_depth] \
@@ -49,13 +49,37 @@ from projectaria_tools.core import data_provider
 from projectaria_tools.core.stream_id import StreamId
 
 # ── Paths ──────────────────────────────────────────────────────────────────
-BASE        = '/user/f.zhang2/Documents/projectaria_tools_adt_data/Apartment_release_golden_skeleton_seq100_10s_sample_M1292'
+BASE        = '/user/f.zhang2/Documents/projectaria_tools_adt_data/Apartment_release_clean_seq131_M1292'
 EGO_VRS     = f'{BASE}/video.vrs'
+# GT_DIR: ADT groundtruth files (aria_trajectory.csv, instances.json, scene_objects.csv).
+# download_adt_rendering_data.py extracts main_groundtruth to <seq>/groundtruth/.
+# Some sequences have the files directly at <seq>/ — both are tried at runtime.
 GT_DIR      = f'{BASE}'
-MODELS_DIR  = f'{BASE}/object_models'
+# MODELS_DIR: directory containing {name}.glb files.
+# Use the shared central object_models from the golden skeleton sequence (all 400 GLBs
+# already downloaded there) as a fallback when seq131/object_models/ is empty.
+_SEQ131_MODELS = f'{BASE}/object_models'
+_GOLDEN_MODELS = (
+    '/user/f.zhang2/Documents/projectaria_tools_adt_data/'
+    'Apartment_release_golden_skeleton_seq100_10s_sample_M1292/object_models'
+)
+def _pick_models_dir(primary, fallback):
+    if os.path.isdir(primary) and any(f.endswith('.glb') for f in os.listdir(primary)):
+        return primary
+    print(f'  [models] {primary!r} has no .glb files — falling back to {fallback!r}')
+    return fallback
+MODELS_DIR  = _pick_models_dir(_SEQ131_MODELS, _GOLDEN_MODELS)
 BLENDER_BIN = '/user/f.zhang2/blender/blender'
 BLEND_SCRIPT= '/user/f.zhang2/projects/adt_egocentric/blender_render_scene.py'
 RGB_STREAM  = StreamId('214-1')
+
+# ── Per-sequence frame range (hard-coded, override via CLI) ─────────────────
+START_FRAME           = 0      # first VRS frame index to render (inclusive)
+END_FRAME             = 300    # last VRS frame index to render (exclusive)
+FRAME_STEP            = 30     # render every Kth frame (~1 fps at 30 Hz VRS)
+
+# ── Fast-render mode ────────────────────────────────────────────────────────
+FAST_RENDER_N_OBJECTS = 5      # keep only the N objects with the largest GLB files
 
 FLIP_YZ = np.diag([1.0, -1.0, -1.0, 1.0])
 
@@ -408,6 +432,21 @@ def build_scene_lights(scene_objects_csv, instances_json_path):
     return lights
 
 
+def _resolve_glb(models_dir: str, name: str) -> str | None:
+    """Try two on-disk layouts for a GLB named 'name':
+      1. {models_dir}/{name}.glb          ← download_adt_object_models.py (flat)
+      2. {models_dir}/{name}/3d-asset.glb ← per-object subdirectory layout
+    Returns the first path that exists, or None.
+    """
+    for p in [
+        os.path.join(models_dir, f'{name}.glb'),
+        os.path.join(models_dir, name, '3d-asset.glb'),
+    ]:
+        if os.path.exists(p):
+            return p
+    return None
+
+
 def build_object_list(instances, obj_poses, models_dir):
     """Return list of {glb_path, T_WO, uid} for objects that have a GLB model.
 
@@ -415,9 +454,9 @@ def build_object_list(instances, obj_poses, models_dir):
     is resolved, so that any baked node rotation stored in the GLB's JSON chunk
     is read and absorbed into the world matrix (R_x_neg90 @ R_baked).
 
-    GLB lookup order:
-      1. {instance_name}.glb  (DTC variant files, e.g. "Hook_4.glb")
-      2. {prototype_name}.glb  (directly-named files, e.g. "KitchIsland.glb")
+    GLB lookup order per candidate name (instance_name first, then prototype_name):
+      1. {models_dir}/{name}.glb          ← flat layout (download_adt_object_models.py)
+      2. {models_dir}/{name}/3d-asset.glb ← subdirectory layout
     """
     uid_to_info = {str(v['instance_id']): v for v in instances.values()}
     result = []
@@ -430,9 +469,8 @@ def build_object_list(instances, obj_poses, models_dir):
         glb_path = None
         for candidate in [instance_name, prototype_name]:
             if candidate:
-                p = os.path.join(models_dir, candidate, '3d-asset.glb')
-                if os.path.exists(p):
-                    glb_path = p
+                glb_path = _resolve_glb(models_dir, candidate)
+                if glb_path:
                     break
         if glb_path:
             T_WO_corrected = correct_object_rotation(T_WO_raw, glb_path)
@@ -735,9 +773,15 @@ def _normals_from_depth_pinhole(depth: np.ndarray,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--num_frames',  type=int,   default=1)
-    parser.add_argument('--frame_step',  type=int,   default=30,
-                        help='Render every Nth frame (default: 30 = ~1fps)')
+    parser.add_argument('--start_frame', type=int,   default=START_FRAME,
+                        help=f'First VRS frame index to render (default: {START_FRAME})')
+    parser.add_argument('--end_frame',   type=int,   default=END_FRAME,
+                        help=f'Last VRS frame index to render, exclusive (default: {END_FRAME})')
+    parser.add_argument('--frame_step',  type=int,   default=FRAME_STEP,
+                        help=f'Render every Kth frame (default: {FRAME_STEP})')
+    parser.add_argument('--fast_render', action='store_true',
+                        help=f'Fast-render mode: load only the {FAST_RENDER_N_OBJECTS} '
+                             f'objects with the largest GLB file sizes')
     parser.add_argument('--output_size', type=int,   default=1408)
     # ADT camera-rgb: 611px focal at 1408px. Scaled to output_size: 611*(S/1408)
     parser.add_argument('--focal',       type=float, default=None,
@@ -768,6 +812,7 @@ def main():
     args.normals      = not args.no_normals
     args.depth        = not args.no_depth
 
+    os.makedirs(f'{args.output_dir}/videos_rgb', exist_ok=True)
     if args.fisheye:
         os.makedirs(f'{args.output_dir}/equirect', exist_ok=True)
         os.makedirs(f'{args.output_dir}/fisheye', exist_ok=True)
@@ -829,60 +874,79 @@ def main():
             print(f'    Done. {valid.sum()} valid pixels '
                   f'({100*valid.mean():.1f}% of image)')
 
-    with open(f'{GT_DIR}/instances.json') as f:
+    # Auto-detect GT_DIR: files may be at BASE/ (seq131 style) or BASE/groundtruth/
+    _gt_candidates = [GT_DIR, os.path.join(GT_DIR, 'groundtruth')]
+    _gt_resolved   = next(
+        (d for d in _gt_candidates if os.path.exists(os.path.join(d, 'instances.json'))),
+        GT_DIR)
+    if _gt_resolved != GT_DIR:
+        print(f'  GT files found in groundtruth/ subdirectory: {_gt_resolved}')
+    GT_DIR_RESOLVED = _gt_resolved
+
+    with open(f'{GT_DIR_RESOLVED}/instances.json') as f:
         instances = json.load(f)
-    traj, ts_arr  = load_trajectory(f'{GT_DIR}/aria_trajectory.csv')
-    static_poses, dynamic_poses = load_all_object_poses(f'{GT_DIR}/scene_objects.csv')
+    traj, ts_arr  = load_trajectory(f'{GT_DIR_RESOLVED}/aria_trajectory.csv')
+    static_poses, dynamic_poses = load_all_object_poses(f'{GT_DIR_RESOLVED}/scene_objects.csv')
 
     print('Building scene lights...')
-    scene_lights = build_scene_lights(f'{GT_DIR}/scene_objects.csv',
-                                      f'{GT_DIR}/instances.json')
+    scene_lights = build_scene_lights(f'{GT_DIR_RESOLVED}/scene_objects.csv',
+                                      f'{GT_DIR_RESOLVED}/instances.json')
 
     static_object_list = build_object_list(instances, static_poses, MODELS_DIR)
+    print(f'  Models dir                     : {MODELS_DIR}')
     print(f'  Static objects with GLB models : {len(static_object_list)}')
     print(f'  Static obj poses               : {len(static_poses)}')
     print(f'  Dynamic object UIDs            : {len(dynamic_poses)}')
+    if len(static_object_list) == 0:
+        print('  WARNING: No static GLB objects resolved — check MODELS_DIR path and GLB filenames.')
+        print(f'    Expected: {MODELS_DIR}/{{name}}.glb  or  {MODELS_DIR}/{{name}}/3d-asset.glb')
 
-    frames_idx = list(range(0, n_frames, args.frame_step))
-    if args.num_frames is not None:
-        frames_idx = frames_idx[:args.num_frames]
-    print(f'  Rendering {len(frames_idx)} frames (step={args.frame_step})')
-    print(f'  Outputs: rgb | comparison'
+    frames_idx = list(range(args.start_frame,
+                            min(args.end_frame, n_frames),
+                            args.frame_step))
+    print(f'  Rendering {len(frames_idx)} frames '
+          f'(start={args.start_frame}, end={min(args.end_frame, n_frames)}, '
+          f'step={args.frame_step})')
+    print(f'  Outputs: videos_rgb'
           f'{" | segmentation" if args.segmentation else ""}'
           f'{" | normal_maps"  if args.normals      else ""}'
           f'{" | depth_maps"   if args.depth        else ""}')
 
     for count, idx in enumerate(frames_idx):
-        if args.fisheye:
-            eq_out_png = f'{args.output_dir}/equirect/frame_{idx:04d}.png'
-            out_png = f'{args.output_dir}/fisheye/frame_{idx:04d}.png'
-            seg_npy_out = f'{args.output_dir}/fisheye/segmentation/frame_{idx:04d}.npy'
-            seg_vis_out = f'{args.output_dir}/fisheye/segmentation/frame_{idx:04d}_vis.png'
-            norm_npy_out = f'{args.output_dir}/fisheye/normal_maps/frame_{idx:04d}.npy'
-            norm_vis_out = f'{args.output_dir}/fisheye/normal_maps/frame_{idx:04d}_vis.png'
-            depth_npy_out = f'{args.output_dir}/fisheye/depth_maps/frame_{idx:04d}.npy'
-            depth_vis_out = f'{args.output_dir}/fisheye/depth_maps/frame_{idx:04d}_vis.png'
-        else:
-            out_png = f'{args.output_dir}/pinhole/frame_{idx:04d}.png'
-            seg_npy_out = f'{args.output_dir}/pinhole/segmentation/frame_{idx:04d}.npy'
-            seg_vis_out = f'{args.output_dir}/pinhole/segmentation/frame_{idx:04d}_vis.png'
-            norm_npy_out = f'{args.output_dir}/pinhole/normal_maps/frame_{idx:04d}.npy'
-            norm_vis_out = f'{args.output_dir}/pinhole/normal_maps/frame_{idx:04d}_vis.png'
-            depth_npy_out = f'{args.output_dir}/pinhole/depth_maps/frame_{idx:04d}.npy'
-            depth_vis_out = f'{args.output_dir}/pinhole/depth_maps/frame_{idx:04d}_vis.png'
-        if os.path.exists(out_png):
-            print(f'  [{count+1}/{len(frames_idx)}] frame {idx:04d} already exists, skipping ({out_png})')
-            continue
-
-        # Get ego RGB for comparison
+        # Fetch timestamp first — needed for filenames aligned with extract_rgb_frames.py
         img_data = p_ego.get_image_data_by_index(RGB_STREAM, idx)
         ts_ns    = img_data[1].capture_timestamp_ns
         ego_rgb  = img_data[0].to_numpy_array()
+
+        frame_stem  = f'frame_{idx:06d}_{ts_ns}'
+        rgb_out_png = f'{args.output_dir}/videos_rgb/{frame_stem}.png'
+        if args.fisheye:
+            eq_out_png    = f'{args.output_dir}/equirect/{frame_stem}.png'
+            seg_npy_out   = f'{args.output_dir}/fisheye/segmentation/{frame_stem}.npy'
+            seg_vis_out   = f'{args.output_dir}/fisheye/segmentation/{frame_stem}_vis.png'
+            norm_npy_out  = f'{args.output_dir}/fisheye/normal_maps/{frame_stem}.npy'
+            norm_vis_out  = f'{args.output_dir}/fisheye/normal_maps/{frame_stem}_vis.png'
+            depth_npy_out = f'{args.output_dir}/fisheye/depth_maps/{frame_stem}.npy'
+            depth_vis_out = f'{args.output_dir}/fisheye/depth_maps/{frame_stem}_vis.png'
+        else:
+            seg_npy_out   = f'{args.output_dir}/pinhole/segmentation/{frame_stem}.npy'
+            seg_vis_out   = f'{args.output_dir}/pinhole/segmentation/{frame_stem}_vis.png'
+            norm_npy_out  = f'{args.output_dir}/pinhole/normal_maps/{frame_stem}.npy'
+            norm_vis_out  = f'{args.output_dir}/pinhole/normal_maps/{frame_stem}_vis.png'
+            depth_npy_out = f'{args.output_dir}/pinhole/depth_maps/{frame_stem}.npy'
+            depth_vis_out = f'{args.output_dir}/pinhole/depth_maps/{frame_stem}_vis.png'
+        if os.path.exists(rgb_out_png):
+            print(f'  [{count+1}/{len(frames_idx)}] frame {idx:06d} already exists, skipping')
+            continue
 
         # Camera pose (pass raw T_WC in ADT coords; Blender script handles conversion)
         T_WD = nearest_pose(traj, ts_arr, ts_ns // 1000)
         T_WC = T_WD @ T_DC
         cam_pos = T_WC[:3, 3]
+        if count == 0:
+            fwd = T_WC[:3, 2]   # camera +Z = forward direction in world
+            print(f'    [diag] cam pos  : ({cam_pos[0]:.3f}, {cam_pos[1]:.3f}, {cam_pos[2]:.3f})')
+            print(f'    [diag] cam fwd  : ({fwd[0]:.3f}, {fwd[1]:.3f}, {fwd[2]:.3f})')
 
         # Resolve dynamic object poses at this frame's timestamp
         dyn_poses_frame = resolve_dynamic_poses(dynamic_poses, ts_ns)
@@ -908,6 +972,14 @@ def main():
               f'({n_dyn} dynamic, '
               f'max dist: {objs_with_dist[len(objs_with_dist)-1][0]:.1f}m)')
 
+        if args.fast_render:
+            objs_by_size = sorted(visible_objects,
+                                  key=lambda o: os.path.getsize(o['glb_path']),
+                                  reverse=True)
+            visible_objects = objs_by_size[:FAST_RENDER_N_OBJECTS]
+            print(f'    Fast-render: kept {len(visible_objects)} largest GLB objects '
+                  f'(sizes: {[os.path.getsize(o["glb_path"]) // (1024*1024) for o in visible_objects]} MB)')
+
         # Assign sequential pass_index values (1-based; 0 = background) for seg mask
         pass_idx_to_uid: dict[int, int] = {}
         for i, obj in enumerate(visible_objects):
@@ -931,21 +1003,20 @@ def main():
             'cycles_samples':  32,
             'pass_idx_to_uid': {str(k): v for k, v in pass_idx_to_uid.items()},
         }
-        json_path = f'{tmp_dir}/frame_{idx:04d}.json'
+        json_path = f'{tmp_dir}/{frame_stem}.json'
         with open(json_path, 'w') as f:
             json.dump(frame_data, f)
 
         if args.fisheye:
             blender_out = eq_out_png
         else:
-            blender_out = out_png
-        # Segmentation EXR path (inside tmp; renamed to final location after render)
-        seg_exr_tmp    = f'{tmp_dir}/seg_{idx:04d}.exr'
-        normal_exr_tmp = f'{tmp_dir}/normal_{idx:04d}.exr'
-        depth_exr_tmp  = f'{tmp_dir}/depth_{idx:04d}.exr'
+            blender_out = f'{tmp_dir}/{frame_stem}_raw.png'
+        seg_exr_tmp    = f'{tmp_dir}/seg_{frame_stem}.exr'
+        normal_exr_tmp = f'{tmp_dir}/normal_{frame_stem}.exr'
+        depth_exr_tmp  = f'{tmp_dir}/depth_{frame_stem}.exr'
 
         # Call Blender
-        print(f'  [{count+1}/{len(frames_idx)}] Rendering frame {idx:04d}...')
+        print(f'  [{count+1}/{len(frames_idx)}] Rendering frame {idx:06d} (ts={ts_ns})...')
         cmd = [
             BLENDER_BIN, '--background', '--python', BLEND_SCRIPT,
             '--', '--frame_data', json_path, '--output', blender_out,
@@ -979,12 +1050,11 @@ def main():
             fish_arr = remap_equirect_to_fisheye(eq_img, map_x, map_y, valid)
             # Apply Aria Gen1 forward ISP so colours match ADT synthetic images
             fish_arr = apply_aria_forward_isp(fish_arr)
-            Image.fromarray(fish_arr).save(out_png)
             render_img = fish_arr
         else:
             render_img = np.array(Image.open(blender_out).convert('RGB'))
             render_img = apply_aria_forward_isp(render_img)
-            Image.fromarray(render_img).save(out_png)
+        Image.fromarray(render_img).save(rgb_out_png)
 
         # ── Segmentation post-processing ────────────────────────────────────
         if args.segmentation:
@@ -1151,7 +1221,7 @@ def main():
         #               (args.output_size, args.output_size), Image.LANCZOS))
         # gap     = np.ones((args.output_size, 4, 3), dtype=np.uint8) * 40
         # side    = np.concatenate([ego_img, gap, render_img], axis=1)
-        # Image.fromarray(side).save(f'{args.output_dir}/comparison/frame_{idx:04d}.png')
+        # Image.fromarray(side).save(f'{args.output_dir}/comparison/{frame_stem}.png')
         print(f'    Done.')
 
     print(f'\nAll done! Outputs in {args.output_dir}/')
