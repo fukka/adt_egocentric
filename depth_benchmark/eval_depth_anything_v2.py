@@ -69,8 +69,11 @@ exo-pinhole-newscene  (render_exocentric_blender.py output, uses NEWSCENE_SEQ_DI
 
 Intrinsics (used for 3DGM / normal estimation from depth)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  ego-fisheye : estimated as if pinhole at image centre (approximate, fisheye
-                back-projection is non-linear but DAv2 operates on the image as-is)
+  ego-fisheye : real Aria RGB focal, treated as a central-pixel pinhole. Fisheye
+                back-projection is non-linear, so this is only a central-region
+                approximation — ego-fisheye 3DGM is NOT comparable to pinhole-mode
+                3DGM. Depth metrics are intrinsics-free and unaffected. For exact
+                wide-angle normals, rectify fisheye→pinhole or use fisheye rays.
   ego-pinhole : ADT Aria focal ≈ 611 px @ 1408 px → scaled to actual render size
   exo-pinhole : focal = (H/2) / tan(VFOV/2),  default VFOV = 70°
 
@@ -88,6 +91,9 @@ Metrics
 -------
 Let T be the set of valid pixels (GT depth finite, 0 < GT ≤ max_depth,
 and aligned prediction finite, 0 < pred ≤ max_depth).
+With --mask_invalid_input, pixels whose input RGB is a black/blank border
+(e.g. outside the Aria fisheye circle) are also removed from T *before*
+alignment, so they cannot skew the scale+shift fit or the metrics.
 Let d̂ᵢ = predicted depth (metres) and dᵢ = GT depth (metres) for pixel i ∈ T.
 
 ── Depth metrics (Eigen et al., NIPS 2014) ──────────────────────────────────
@@ -178,7 +184,8 @@ from PIL import Image
 # Shared utilities (must be in the same directory or on PYTHONPATH)
 sys.path.insert(0, os.path.dirname(__file__))
 from eval_utils import (
-    load_rgb, load_depth_gt, get_valid_mask,
+    load_rgb, load_depth_gt, get_valid_mask, get_input_valid_mask,
+    valid_eval_mask,
     align_scale_shift_disparity,
     compute_metrics, print_metrics,
     save_comparison_figure, append_to_csv,
@@ -330,6 +337,29 @@ def _exo_intrinsics(h: int, w: int, vfov_deg: float = _EXO_DEFAULT_VFOV_DEG) -> 
     fx = fy   # square pixels, symmetric lens
     cx, cy = w / 2.0, h / 2.0
     return fx, fy, cx, cy
+
+
+def _restrict_to_valid_input(mask: np.ndarray, rgb: np.ndarray,
+                             gt_shape: tuple, args) -> np.ndarray:
+    """
+    Optionally AND the GT-valid *mask* with the valid-input-region mask.
+
+    When --mask_invalid_input is set, pixels whose input RGB is a black/blank
+    border (e.g. outside the Aria fisheye circle) are removed so they cannot
+    corrupt the least-squares alignment or the reported metrics.  The input
+    mask is derived from *rgb* (RGB/prediction resolution) and resized with
+    nearest-neighbour to the GT resolution when the two differ.
+    """
+    if not getattr(args, 'mask_invalid_input', False):
+        return mask
+    input_valid = get_input_valid_mask(rgb, args.input_black_thresh,
+                                       args.input_valid_erode)
+    if input_valid.shape != tuple(gt_shape):
+        import cv2  # available via eval_utils' dependency set
+        input_valid = cv2.resize(
+            input_valid.astype(np.uint8), (gt_shape[1], gt_shape[0]),
+            interpolation=cv2.INTER_NEAREST).astype(bool)
+    return mask & input_valid
 
 
 
@@ -686,6 +716,9 @@ def run_batch(args) -> None:
             k  = {90: 1, 180: 2, 270: 3}[_rotation]
             gt = np.rot90(gt, k=k).copy()
         mask = get_valid_mask(gt)
+        # Optionally drop black/blank input-border pixels (e.g. outside the Aria
+        # fisheye circle) so they cannot corrupt alignment or metrics.
+        mask = _restrict_to_valid_input(mask, rgb, gt.shape, args)
         if mask.sum() < 100:
             print(f"    [WARN] Only {mask.sum()} valid GT pixels — skipping")
             continue
@@ -709,9 +742,9 @@ def run_batch(args) -> None:
         else:
             pred_aligned = align_scale_shift_disparity(pred_raw, gt, mask)
 
-        # Exclude invalid depth pixels from metrics
-        depth_mask = (mask & np.isfinite(pred_aligned)
-                      & (pred_aligned > 0) & (pred_aligned <= args.max_depth))
+        # Common valid-pixel set (GT-in-range ∩ pred-in-range) — the SAME rule
+        # every baseline uses, so no model is scored on a different pixel set.
+        depth_mask = valid_eval_mask(pred_aligned, gt, mask, max_depth=args.max_depth)
         metrics    = compute_metrics(pred_aligned, gt, depth_mask)
         n_ok += 1
 
@@ -762,8 +795,14 @@ def run_batch(args) -> None:
             # real / real-newscene use the Aria RGB camera — same focal-length
             # model as ego-pinhole
             fx, fy, cx, cy = _ego_intrinsics(h, w)
-        else:  # ego-fisheye — use estimated pinhole approx
-            fx, fy, cx, cy = estimate_intrinsics(h, w)
+        else:  # ego-fisheye
+            # Use the REAL Aria RGB focal (central-pixel pinhole model) rather
+            # than an arbitrary 55° FoV. This is still only a central-pixel
+            # approximation of a fisheye lens, so ego-fisheye 3DGM is NOT
+            # comparable to pinhole-mode 3DGM (documented in the header). For
+            # geometrically exact wide-angle normals, rectify fisheye→pinhole
+            # (RGB+GT) or back-project with per-pixel fisheye ray directions.
+            fx, fy, cx, cy = _ego_intrinsics(h, w)
 
         # Derive normals from depth; pred_aligned already has NaN where invalid
         # (disparity ≤ 0), so depth_to_normals propagates those as NaN normals
@@ -819,6 +858,7 @@ def run_batch(args) -> None:
         'delta1':  px_depth['d1'] / _n,
         'delta2':  px_depth['d2'] / _n,
         'delta3':  px_depth['d3'] / _n,
+        'n_valid': px_depth['n'],
     }
 
     dgm_mean = None
@@ -969,6 +1009,18 @@ def main():
                              "Overrides per-mode defaults (1.0 for ego/exo, 0.001 for real).")
     parser.add_argument("--max_depth", type=float, default=10.0,
                         help="GT depth values above this (metres) are invalid")
+    parser.add_argument("--mask_invalid_input", action="store_true", default=False,
+                        help="Exclude pixels whose input RGB is a black/blank border "
+                             "(e.g. outside the Aria fisheye circle) from alignment, "
+                             "depth metrics and 3DGM. Pixels where GT depth is invalid "
+                             "are always excluded regardless of this flag.")
+    parser.add_argument("--input_black_thresh", type=int, default=8,
+                        help="With --mask_invalid_input: an input pixel is treated as "
+                             "invalid when max(R,G,B) <= this value (default: 8).")
+    parser.add_argument("--input_valid_erode", type=int, default=0,
+                        help="With --mask_invalid_input: erode the valid-input region by "
+                             "this many pixels to also drop the noisy ring at the fisheye "
+                             "circle boundary (default: 0 = disabled).")
     parser.add_argument("--device", default=None,
                         help="'cuda' or 'cpu' (default: auto-detect)")
     parser.add_argument("--csv", default=None,
@@ -1029,6 +1081,14 @@ def main():
         mask = get_valid_mask(gt)
         print(f"         GT rotated  : {gt.shape}  valid px: {mask.sum()}")
 
+    # Optionally drop black/blank input-border pixels (e.g. outside the Aria
+    # fisheye circle) so they cannot corrupt alignment or metrics.
+    if args.mask_invalid_input:
+        mask = _restrict_to_valid_input(mask, rgb, gt.shape, args)
+        print(f"         Input-masked: valid px: {mask.sum()} "
+              f"(black_thresh={args.input_black_thresh}, "
+              f"erode={args.input_valid_erode})")
+
     # ── Inference ────────────────────────────────────────────────────────────
     print(f"  [DAv2] Running inference (variant={args.variant}) …")
     model = _load_model(args)
@@ -1044,8 +1104,7 @@ def main():
     else:
         pred_aligned = align_scale_shift_disparity(pred_raw, gt, mask)
 
-    depth_mask = (mask & np.isfinite(pred_aligned)
-                  & (pred_aligned > 0) & (pred_aligned <= args.max_depth))
+    depth_mask = valid_eval_mask(pred_aligned, gt, mask, max_depth=args.max_depth)
     if not _no_align:
         valid_depths = pred_aligned[depth_mask]
         print(f"  [DAv2] Aligned depth range: [{valid_depths.min():.3f}, "
