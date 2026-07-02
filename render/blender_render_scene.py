@@ -27,6 +27,9 @@ Normal output (--normal_output):
   from OpenCV means B=Z, G=Y, R=X — flip channels to get (X,Y,Z).
   Rendered from the opaque-override ViewLayer (same as segmentation) so
   glass/transparent surfaces are always solid — no dotty dropout pattern.
+  NOTE: render_from_poses_blender.py requests this only for --blender_normals
+  (debug mode). The default normal map is computed from the depth map instead,
+  which guarantees consistency with depth_to_normals() in eval_utils.py.
 
 Depth output (--depth_output):
   Camera-space distance (Z pass) written as float32 RGB EXR (depth value
@@ -79,10 +82,35 @@ with open(args.frame_data) as f:
 bpy.ops.wm.read_homefile(use_empty=True)
 scene = bpy.context.scene
 scene.render.engine = 'CYCLES'
-bpy.context.preferences.addons['cycles'].preferences.compute_device_type = 'NONE'
-scene.cycles.device = 'CPU'
+
+# ── Cycles device (CPU / CUDA / OPTIX / HIP / METAL) ─────────────────────
+# Read from frame_data['cycles_device'] written by render_from_poses_blender.py.
+# Default to CPU so the script is always safe to run without a GPU.
+_cycles_device = data.get('cycles_device', 'CPU').upper()
+_cycles_prefs  = bpy.context.preferences.addons['cycles'].preferences
+if _cycles_device == 'CPU':
+    _cycles_prefs.compute_device_type = 'NONE'
+    scene.cycles.device = 'CPU'
+else:
+    _cycles_prefs.compute_device_type = _cycles_device   # 'CUDA', 'OPTIX', 'HIP', 'METAL'
+    _cycles_prefs.get_devices()
+    for _dev in _cycles_prefs.devices:
+        _dev.use = True   # enable all available GPU tiles
+    scene.cycles.device = 'GPU'
+    scene.cycles.tile_size = 256   # larger tiles benefit GPU throughput
+    print(f'[cycles] GPU device: {_cycles_device}')
+
 scene.cycles.samples = data.get('cycles_samples', 32)
-scene.cycles.use_denoising = True
+
+# ── Denoiser ──────────────────────────────────────────────────────────────
+_denoiser = data.get('cycles_denoiser', 'NONE').upper()
+if _denoiser != 'NONE':
+    scene.cycles.use_denoising = True
+    scene.cycles.denoiser = _denoiser   # 'OPENIMAGEDENOISE' or 'OPTIX'
+    print(f'[cycles] Denoiser: {_denoiser}')
+else:
+    scene.cycles.use_denoising = True   # keep existing default on
+
 scene.cycles.use_adaptive_sampling = True
 scene.cycles.adaptive_threshold = 0.05
 
@@ -113,11 +141,22 @@ if scene_lights:
         ltype = ldef.get('type', 'POINT')
         if ltype == 'AREA':
             bpy.ops.object.light_add(type='AREA', location=loc)
-            light = bpy.context.object.data
+            light_obj = bpy.context.object
+            light = light_obj.data
             light.energy = eng
             light.color  = col
             light.size   = ldef.get('size', 1.8)
-            bpy.context.object.rotation_euler = (-math.pi / 2, 0, 0)
+            light_obj.rotation_euler = (-math.pi / 2, 0, 0)
+            # Hide area-light panels from camera rays: prevents the emitter
+            # rectangle from appearing as a bright patch on the ceiling.
+            # The light still illuminates the scene normally.
+            try:
+                light_obj.visible_camera = False   # Blender 3.x+
+            except AttributeError:
+                try:
+                    light_obj.cycles_visibility.camera = False  # Blender 2.8x
+                except Exception:
+                    pass
         else:
             bpy.ops.object.light_add(type='POINT', location=loc)
             light = bpy.context.object.data

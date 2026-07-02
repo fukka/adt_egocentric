@@ -47,7 +47,7 @@ DEFAULT_URLS_JSON  = os.path.expanduser(
     '~/Documents/projectaria_sandbox/projectaria_tools/ADT_download_urls.json'
 )
 DEFAULT_OUTPUT_DIR = os.path.expanduser(
-    '~/Documents/projectaria_tools_adt_data'
+    '~/Documents/projectaria_tools_adt_data_clean'
 )
 DEFAULT_DATA_TYPE  = 0   # 0 = main_vrs
 
@@ -66,7 +66,7 @@ def is_already_downloaded(output_dir: str, sequence_name: str) -> bool:
     main_recording.vrs file — the canonical output of -d 0.
     """
     seq_dir = os.path.join(output_dir, sequence_name)
-    vrs_path = os.path.join(seq_dir, 'main_recording.vrs')
+    vrs_path = os.path.join(seq_dir, 'video.vrs')
     return os.path.isfile(vrs_path)
 
 

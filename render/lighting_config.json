@@ -1,0 +1,58 @@
+{
+  "_comment": [
+    "Lighting parameters for Blender Cycles rendering of the ADT Apartment scene.",
+    "Edit these values to tune brightness/colour without touching Python code.",
+    "Ceiling energy calibration reference:",
+    "  egocentric — tuned so render mean matches ADT synthetic (≈61) after Aria ISP.",
+    "  exocentric — lower ceiling (actual geometry height) and lower energy for",
+    "               third-person views that are not ISP-corrected to Aria output.",
+    "Tune with: python calibrate_lighting.py --mode ego/exo"
+  ],
+
+  "prop_lights": {
+    "_comment": "Physical lamp props found in scene_objects.csv by name prefix.",
+    "Lamp":          {"energy": 20.0, "color": [1.0, 0.88, 0.70], "radius": 0.15},
+    "WhitTableLamp": {"energy": 15.0, "color": [1.0, 0.90, 0.72], "radius": 0.12},
+    "NightLight":    {"energy":  4.0, "color": [1.0, 0.80, 0.60], "radius": 0.05},
+    "Candle":        {"energy":  1.5, "color": [1.0, 0.70, 0.40], "radius": 0.02}
+  },
+
+  "ceiling": {
+    "_comment": [
+      "30 AREA lights on a 5×6 grid covering the full apartment floor plan.",
+      "Grid redesigned for uniform 1.5 m spacing in both X and Z so that",
+      "ALL rooms (kitchen, living room, bedroom) receive equal illumination.",
+      "",
+      "Apartment floor extent from mesh analysis:",
+      "  X: -4.0 to +3.0  →  5 positions at 1.5 m steps: -3.5, -2.0, -0.5, 1.0, 2.5",
+      "  Z: -4.0 to +5.0  →  6 positions at 1.5 m steps: -3.5, -2.0, -0.5, 1.0, 2.5, 4.0",
+      "",
+      "Key coverage vs old grid:",
+      "  Bedroom (Z -3.82 to -0.20): now 3 lights (Z=-3.5, -2.0, -0.5) vs 2 before.",
+      "  Bedroom centre Z=-2.01 now has a panel directly above it (was uncovered).",
+      "  Kitchen/living (Z 0 to 5): 4 lights (Z=-0.5, 1.0, 2.5, 4.0) vs 4 before.",
+      "  Removed Z=5.0 and Z=7.5 (both outside apartment ceiling area).",
+      "",
+      "Total panels: 5 x 6 = 30 (same count, so no energy re-calibration needed).",
+      "Adjacent tiles overlap by ~2 m so there is no hotspot banding.",
+      "Panels are hidden from the camera ray (visible_camera=False in",
+      "blender_render_scene.py) to avoid bright-patch artefacts on the ceiling."
+    ],
+    "grid_x": [-3.5, -2.0, -0.5,  1.0, 2.5],
+    "grid_z": [-3.5, -2.0, -0.5,  1.0, 2.5, 4.0],
+    "color":  [1.0, 0.92, 0.80],
+    "size":   3.5,
+    "modes": {
+      "egocentric": {
+        "_comment": "CEIL_Y raised to 3.3 m (above true ceiling) to brighten narrow FOV ego views.",
+        "y":      3.0,
+        "energy": 160.0
+      },
+      "exocentric": {
+        "_comment": "CEIL_Y at 2.45 m (just below 2.5 m ceiling) for wide third-person views.",
+        "y":      3.0,
+        "energy": 160.0
+      }
+    }
+  }
+}

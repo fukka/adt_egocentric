@@ -14,16 +14,18 @@ Usage:
 """
 
 import sys, os, argparse
-sys.path.insert(0, '/sessions/dreamy-modest-brown/.local/lib/python3.10/site-packages')
+# sys.path.insert(0, '/sessions/dreamy-modest-brown/.local/lib/python3.10/site-packages')
+sys.path.insert(0, '/user/f.zhang2/.local/lib/python3.10/site-packages')
 
 import numpy as np
 from PIL import Image
 from projectaria_tools.core import data_provider, calibration
 from projectaria_tools.core.stream_id import StreamId
 
-BASE = '/sessions/dreamy-modest-brown/mnt/ADT/Apartment_release_golden_skeleton_seq100_10s_sample_M1292'
-EGO_VRS  = os.path.join(BASE, 'main_recording.vrs')
-SYN_VRS  = os.path.join(BASE, 'synthetic', 'synthetic_video.vrs')
+BASE = '/user/f.zhang2/Documents/projectaria_tools_adt_data/Apartment_release_clean_seq131_M1292'
+# BASE = '/user/f.zhang2/Documents/projectaria_tools_adt_data/Apartment_release_golden_skeleton_seq100_10s_sample_M1292'
+EGO_VRS  = os.path.join(BASE, 'video.vrs')
+SYN_VRS  = os.path.join(BASE, 'synthetic_video.vrs')
 RGB_STREAM = StreamId('214-1')
 
 
@@ -85,16 +87,17 @@ def main():
     ego_calib = p_ego.get_device_calibration().get_camera_calib('camera-rgb')
     n_ego = p_ego.get_num_data(RGB_STREAM)
 
-    print('Loading synthetic VRS...')
-    p_syn = data_provider.create_vrs_data_provider(SYN_VRS)
-    syn_calib_raw = p_syn.get_device_calibration().get_camera_calib('camera-rgb')
-    n_syn = p_syn.get_num_data(RGB_STREAM)
+    # print('Loading synthetic VRS...')
+    # p_syn = data_provider.create_vrs_data_provider(SYN_VRS)
+    # syn_calib_raw = p_syn.get_device_calibration().get_camera_calib('camera-rgb')
+    # n_syn = p_syn.get_num_data(RGB_STREAM)
 
-    n_frames = min(n_ego, n_syn)
-    if args.num_frames is not None:
-        n_frames = min(n_frames, args.num_frames)
-    print(f'\nTotal paired frames available: min({n_ego}, {n_syn}) = {min(n_ego,n_syn)}')
-    print(f'Processing: {n_frames} frames')
+    n_frames = n_ego
+    # n_frames = min(n_ego, n_syn)
+    # if args.num_frames is not None:
+    #     n_frames = min(n_frames, args.num_frames)
+    # print(f'\nTotal paired frames available: min({n_ego}, {n_syn}) = {min(n_ego,n_syn)}')
+    # print(f'Processing: {n_frames} frames')
 
     # ── Calibrations ────────────────────────────────────────────────────────
     print('\n─── Egocentric calibration ───')
@@ -103,14 +106,15 @@ def main():
     print(f'  focal_px  : {ego_calib.get_focal_lengths()}')
 
     # Get actual frame size for synthetic to detect mismatch
-    syn_frame0 = p_syn.get_image_data_by_index(RGB_STREAM, 0)[0].to_numpy_array()
-    actual_h, actual_w = syn_frame0.shape[:2]
-    print('\n─── Synthetic calibration ───')
-    print(f'  model            : {syn_calib_raw.get_model_name()}')
-    print(f'  calib image_size : {syn_calib_raw.get_image_size()}')
-    print(f'  actual frame size: {actual_w}x{actual_h}')
-    syn_calib = rescale_calibration(syn_calib_raw, actual_w, actual_h)
-    print(f'  rescaled focal_px: {syn_calib.get_focal_lengths()}')
+    # syn_frame0 = p_syn.get_image_data_by_index(RGB_STREAM, 0)[0].to_numpy_array()
+    # actual_h, actual_w = syn_frame0.shape[:2]
+    # print('\n─── Synthetic calibration ───')
+    # print(f'  model            : {syn_calib_raw.get_model_name()}')
+    # print(f'  calib image_size : {syn_calib_raw.get_image_size()}')
+    # print(f'  actual frame size: {actual_w}x{actual_h}')
+    # # syn_calib = rescale_calibration(syn_calib_raw, actual_w, actual_h)
+    # # print(f'  rescaled focal_px: {syn_calib.get_focal_lengths()}')
+    # syn_calib = syn_calib_raw
 
     # ── Build linear target calibration ─────────────────────────────────────
     print(f'\n─── Target LINEAR calibration ───')
@@ -125,31 +129,31 @@ def main():
     for i in range(n_frames):
         # Load raw frames
         ego_arr = p_ego.get_image_data_by_index(RGB_STREAM, i)[0].to_numpy_array()
-        syn_arr = p_syn.get_image_data_by_index(RGB_STREAM, i)[0].to_numpy_array()
+        # syn_arr = p_syn.get_image_data_by_index(RGB_STREAM, i)[0].to_numpy_array()
 
         # Rectify
         ego_rect = rectify_frame(ego_arr, ego_calib, dst_calib)
-        syn_rect = rectify_frame(syn_arr, syn_calib, dst_calib)
+        # syn_rect = rectify_frame(syn_arr, syn_calib, dst_calib)
 
         # Save individual frames
         Image.fromarray(ego_rect).save(os.path.join(args.output_dir, 'ego', f'frame_{i:04d}.png'))
-        Image.fromarray(syn_rect).save(os.path.join(args.output_dir, 'synthetic', f'frame_{i:04d}.png'))
+        # Image.fromarray(syn_rect).save(os.path.join(args.output_dir, 'synthetic', f'frame_{i:04d}.png'))
 
         # Save side-by-side comparison
         pad = 4
         combined = np.ones((args.output_size, args.output_size * 2 + pad, 3), dtype=np.uint8) * 40
         combined[:, :args.output_size] = ego_rect
-        combined[:, args.output_size + pad:] = syn_rect
-        Image.fromarray(combined).save(
-            os.path.join(args.output_dir, 'side_by_side', f'frame_{i:04d}.png'))
+        # combined[:, args.output_size + pad:] = syn_rect
+        # Image.fromarray(combined).save(
+        #     os.path.join(args.output_dir, 'side_by_side', f'frame_{i:04d}.png'))
 
         if (i + 1) % 10 == 0 or i == n_frames - 1:
             print(f'  [{i+1:3d}/{n_frames}] done')
 
     print(f'\nAll done! Rectified pairs saved to: {args.output_dir}')
     print(f'  {args.output_dir}/ego/         — rectified real egocentric frames')
-    print(f'  {args.output_dir}/synthetic/   — rectified synthetic frames')
-    print(f'  {args.output_dir}/side_by_side/ — paired comparisons')
+    # print(f'  {args.output_dir}/synthetic/   — rectified synthetic frames')
+    # print(f'  {args.output_dir}/side_by_side/ — paired comparisons')
 
 
 if __name__ == '__main__':
