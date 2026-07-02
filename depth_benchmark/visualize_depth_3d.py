@@ -28,6 +28,13 @@ Additional options
 ------------------
   --stride      Subsample stride (default 2). Increase for speed on large images.
   --max_depth   Clip depth beyond this value in metres (default 10.0).
+  --mask_invalid_input
+                Drop points whose input RGB is a black/blank border (e.g. outside
+                the Aria fisheye circle).  Tune with --input_black_thresh and
+                --input_valid_erode.
+  --gt_depth PATH
+                Optional GT depth .npy; also drop points where GT depth is invalid
+                (non-finite, ≤0, or > --max_depth).  Scale it with --gt_depth_scale.
   --point_size  Point size in the Open3D window (default 2.0).
   --bg_color    Background colour for Open3D: dark | white (default dark).
   --variant     Label string shown in figure titles (default: pred_aligned).
@@ -100,17 +107,21 @@ def depth_to_pointcloud(depth: np.ndarray,
                          fx: float, fy: float,
                          cx: float, cy: float,
                          max_depth: float = 10.0,
-                         stride: int = 2):
+                         stride: int = 2,
+                         extra_valid: np.ndarray = None):
     """
     Back-project a depth map to a coloured 3-D point cloud.
 
     Parameters
     ----------
-    depth     : (H, W) float32 depth in metres
-    rgb       : (H, W, 3) uint8 RGB image (must match depth H×W)
+    depth       : (H, W) float32 depth in metres
+    rgb         : (H, W, 3) uint8 RGB image (must match depth H×W)
     fx,fy,cx,cy : pinhole camera intrinsics
-    max_depth : discard points beyond this distance
-    stride    : pixel subsampling step (2 = every other pixel in each axis)
+    max_depth   : discard points beyond this distance
+    stride      : pixel subsampling step (2 = every other pixel in each axis)
+    extra_valid : optional (H, W) bool mask — additional per-pixel validity to
+                  AND with the depth-range check (e.g. drop black input borders
+                  or pixels where GT depth is invalid).  None keeps all pixels.
 
     Returns
     -------
@@ -128,6 +139,8 @@ def depth_to_pointcloud(depth: np.ndarray,
 
     d = depth[vv, uu]
     valid = np.isfinite(d) & (d > 0.01) & (d < max_depth)
+    if extra_valid is not None:
+        valid &= extra_valid[vv, uu]
 
     d  = d[valid]
     uu = uu[valid]
@@ -404,6 +417,23 @@ def main():
     parser.add_argument("--max_depth", type=float, default=10.0,
                         help="Clip depth beyond this value in metres (default 10.0).")
 
+    # ── Invalid-region masking ────────────────────────────────────────────────
+    parser.add_argument("--mask_invalid_input", action="store_true", default=False,
+                        help="Drop points whose input RGB is a black/blank border "
+                             "(e.g. outside the Aria fisheye circle).")
+    parser.add_argument("--input_black_thresh", type=int, default=8,
+                        help="With --mask_invalid_input: a pixel is invalid input when "
+                             "max(R,G,B) <= this value (default: 8).")
+    parser.add_argument("--input_valid_erode", type=int, default=0,
+                        help="With --mask_invalid_input: erode the valid-input region by "
+                             "this many pixels (default: 0 = disabled).")
+    parser.add_argument("--gt_depth", default=None, metavar="PATH",
+                        help="Optional GT depth .npy. When given, points where GT depth "
+                             "is invalid (non-finite, <=0, or > --max_depth) are dropped.")
+    parser.add_argument("--gt_depth_scale", type=float, default=1.0,
+                        help="Multiply GT depth (--gt_depth) by this factor before the "
+                             "validity check (e.g. 0.001 for mm→m; default 1.0).")
+
     # ── Open3D rendering ──────────────────────────────────────────────────────
     parser.add_argument("--point_size", type=float, default=2.0,
                         help="Point size in Open3D window (default 2.0).")
@@ -448,12 +478,49 @@ def main():
         print(f"  Intrinsics    : estimated (55° diag FoV) "
               f"fx={fx:.1f}  fy={fy:.1f}  cx={cx:.1f}  cy={cy:.1f}")
 
+    # ── Build optional invalid-region mask ────────────────────────────────────
+    # extra_valid is at depth resolution (H, W); rgb has already been resized to
+    # (H, W) above so it can be used directly.
+    extra_valid = None
+    if args.mask_invalid_input:
+        lum = rgb.max(axis=-1) if rgb.ndim == 3 else rgb
+        iv = lum > args.input_black_thresh
+        if args.input_valid_erode > 0:
+            try:
+                import cv2
+                k = 2 * int(args.input_valid_erode) + 1
+                iv = cv2.erode(iv.astype(np.uint8),
+                               np.ones((k, k), np.uint8)).astype(bool)
+            except ImportError:
+                print("    [WARN] --input_valid_erode needs opencv (cv2); "
+                      "skipping erosion.")
+        extra_valid = iv
+        print(f"  Input-valid mask : {iv.sum():,}/{iv.size:,} px "
+              f"(black_thresh={args.input_black_thresh}, "
+              f"erode={args.input_valid_erode})")
+
+    if args.gt_depth is not None:
+        print(f"  Loading GT depth : {args.gt_depth}")
+        gt = np.load(args.gt_depth).astype(np.float32)
+        if gt.ndim == 3:
+            gt = gt.squeeze(-1)
+        gt = gt * args.gt_depth_scale
+        gt_valid = np.isfinite(gt) & (gt > 0) & (gt <= args.max_depth)
+        if gt_valid.shape != (H, W):
+            gt_valid = np.array(
+                Image.fromarray((gt_valid.astype(np.uint8) * 255))
+                .resize((W, H), Image.NEAREST)) > 127
+        extra_valid = gt_valid if extra_valid is None else (extra_valid & gt_valid)
+        print(f"  GT-valid mask    : {gt_valid.sum():,}/{gt_valid.size:,} px "
+              f"(scale={args.gt_depth_scale}, max_depth={args.max_depth} m)")
+
     # ── Build point cloud ─────────────────────────────────────────────────────
     print(f"  Building point cloud (stride={args.stride}, max_depth={args.max_depth} m) …")
     xyz, colors = depth_to_pointcloud(
         depth, rgb, fx, fy, cx, cy,
         max_depth=args.max_depth,
         stride=args.stride,
+        extra_valid=extra_valid,
     )
     print(f"    {len(xyz):,} points")
 

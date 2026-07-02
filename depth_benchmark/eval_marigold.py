@@ -7,8 +7,9 @@ Benchmark baseline: Marigold  (CVPR 2024 Oral)
           prs-eth/marigold-depth-lcm-v1-0     (LCM fast variant, ~4 steps)
 
 Marigold is an affine-invariant (relative) depth estimator built on
-Stable Diffusion. Predicted depth is aligned to GT via least-squares
-scale+shift before evaluation.
+Stable Diffusion. Its output is disparity-like (near = high), so it is aligned
+to GT via least-squares scale+shift in DISPARITY space before evaluation
+(the MiDaS/DAv2 protocol — depth-space alignment cannot undo the disparity shift).
 
 Usage
 -----
@@ -39,7 +40,7 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(__file__))
 from eval_utils import (
     load_rgb, load_depth_gt, get_valid_mask,
-    align_scale_shift,
+    align_scale_shift_disparity,
     compute_metrics, print_metrics,
     save_comparison_figure, append_to_csv,
 )
@@ -164,18 +165,22 @@ def main():
                               ensemble_size=args.ensemble,
                               device=args.device)
 
-    # Marigold outputs disparity ([0,1], near=1). Convert to pseudo-depth by
-    # flipping, then align affinely — the alignment handles scale & shift.
-    # Some pipelines already output depth; if so, remove the flip.
-    pred_pseudo_depth = 1.0 - pred_disp   # higher value = farther away
-
+    # Marigold outputs disparity-like values ([0,1], near=1 → higher = closer),
+    # the same polarity as 1/depth. Align in DISPARITY space (MiDaS / DAv2
+    # protocol), NOT depth space: a depth-space affine fit cannot undo the
+    # disparity SHIFT and mis-scores even a perfect disparity model. The old
+    # `1 - disp` pseudo-depth + depth-space `align_scale_shift` was exactly that
+    # bug. See eval_utils.align_scale_shift_disparity.
     # ── Alignment ────────────────────────────────────────────────────────────
-    alignment = "scale+shift (least-squares)"
-    pred_aligned = align_scale_shift(pred_pseudo_depth, gt, mask)
-    print(f"  [Marigold] Aligned range: [{pred_aligned[mask].min():.3f}, {pred_aligned[mask].max():.3f}] m")
+    alignment = "scale+shift-disparity (least-squares)"
+    pred_aligned = align_scale_shift_disparity(pred_disp, gt, mask)
+    _valid_aligned = pred_aligned[mask & np.isfinite(pred_aligned)]
+    if _valid_aligned.size:
+        print(f"  [Marigold] Aligned range: "
+              f"[{_valid_aligned.min():.3f}, {_valid_aligned.max():.3f}] m")
 
     # ── Metrics ──────────────────────────────────────────────────────────────
-    metrics = compute_metrics(pred_aligned, gt, mask)
+    metrics = compute_metrics(pred_aligned, gt, mask, max_depth=args.max_depth)
     print_metrics(metrics, model="Marigold", variant=args.variant, alignment=alignment)
 
     # ── Save ─────────────────────────────────────────────────────────────────

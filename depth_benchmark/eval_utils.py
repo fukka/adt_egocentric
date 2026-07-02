@@ -41,6 +41,7 @@ METRICS_HEADER = [
     "model", "variant",
     "AbsRel", "SqRel", "RMSE", "RMSElog",
     "delta1", "delta2", "delta3",
+    "scale_ratio", "n_valid",
     "alignment",
 ]
 
@@ -108,6 +109,44 @@ def get_valid_mask(gt: np.ndarray) -> np.ndarray:
     return np.isfinite(gt) & (gt > 0)
 
 
+def get_input_valid_mask(rgb: np.ndarray,
+                         black_thresh: int = 8,
+                         erode_px: int = 0) -> np.ndarray:
+    """
+    Boolean mask of pixels whose *input* RGB is valid (i.e. not part of a
+    black/blank border).
+
+    Egocentric Aria frames — both the real sensor images and the rendered
+    fisheye — have a circular valid region surrounded by a black border.  A
+    monocular depth network still emits a (meaningless) depth prediction for
+    those black pixels.  If such pixels are left in the valid set they
+    (a) corrupt the global least-squares scale+shift alignment and
+    (b) pollute the reported metrics.  This helper flags them so callers can
+    exclude them from alignment, depth metrics, and 3DGM.
+
+    A pixel is treated as invalid input when ``max(R, G, B) <= black_thresh``
+    (near-black).  Optionally the valid region is eroded by ``erode_px`` pixels
+    to also drop the noisy interpolation ring at the circle boundary.
+
+    Parameters
+    ----------
+    rgb          : (H, W, 3) uint8 RGB, or (H, W) grayscale
+    black_thresh : a pixel is "black"/invalid when its max channel <= this
+    erode_px     : shrink the valid region by this many pixels (0 = disabled)
+
+    Returns
+    -------
+    np.ndarray bool (H, W) — True where the input pixel is valid.
+    """
+    lum   = rgb.max(axis=-1) if rgb.ndim == 3 else rgb
+    valid = lum > black_thresh
+    if erode_px and erode_px > 0:
+        k = 2 * int(erode_px) + 1
+        kernel = np.ones((k, k), np.uint8)
+        valid = cv2.erode(valid.astype(np.uint8), kernel).astype(bool)
+    return valid
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Depth alignment
 # ──────────────────────────────────────────────────────────────────────────────
@@ -170,25 +209,83 @@ def align_scale_only(pred: np.ndarray, gt: np.ndarray,
 # Evaluation metrics
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_metrics(pred: np.ndarray, gt: np.ndarray,
-                    mask: np.ndarray) -> dict:
+def valid_eval_mask(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray,
+                    min_depth: float = 0.01,
+                    max_depth: float = None) -> np.ndarray:
     """
-    Compute standard depth evaluation metrics over valid (masked) pixels.
+    The common valid-pixel set for depth metrics, applied identically to
+    **every** model so no baseline is scored on a different pixel set.
+
+    A pixel counts only when the GT is valid & in range AND the prediction is
+    finite & in range::
+
+        mask ∧ finite(gt) ∧ gt > min_depth [∧ gt ≤ max_depth]
+             ∧ finite(pred) ∧ pred > 0     [∧ pred ≤ max_depth]
+
+    Excluding out-of-range predictions is necessary because a relative model's
+    disparity alignment can push a few pixels' aligned disparity ≈ 0 → depth
+    ≈ 1e6, which would otherwise dominate SqRel/RMSE.  The important property is
+    that the SAME rule is used for metric and relative models alike — call this
+    from every eval script (and for pixel-weighted aggregation / 3DGM) so the
+    valid set is identical across the benchmark.  Report ``n_valid`` alongside
+    the metrics so differing coverage between models stays auditable.
+
+    Parameters
+    ----------
+    pred, gt  : float32 (H, W) — aligned prediction and GT depth (metres)
+    mask      : bool (H, W)    — GT-valid mask (e.g. from get_valid_mask)
+    min_depth : lower depth bound (metres)
+    max_depth : upper depth bound (metres); None disables the upper check
+    """
+    m = (mask & np.isfinite(gt) & (gt > min_depth)
+         & np.isfinite(pred) & (pred > 0))
+    if max_depth is not None:
+        m = m & (gt <= max_depth) & (pred <= max_depth)
+    return m
+
+
+def compute_metrics(pred: np.ndarray, gt: np.ndarray,
+                    mask: np.ndarray,
+                    min_depth: float = 0.01,
+                    max_depth: float = None) -> dict:
+    """
+    Compute standard depth evaluation metrics over the common valid-pixel set.
+
+    The valid set is built internally via :func:`valid_eval_mask`, so passing a
+    plain GT-valid mask here yields the SAME rule (GT-in-range ∩ pred-in-range)
+    that every other baseline uses — the caller no longer has to hand-build a
+    prediction-range mask.  Pass ``max_depth`` (each script has ``args.max_depth``)
+    to enable the upper-range exclusion.
 
     Parameters
     ----------
     pred  : predicted depth map (float32, H×W), already aligned to GT scale
     gt    : ground-truth depth map (float32, H×W)
-    mask  : boolean valid-pixel mask (H×W)
+    mask  : boolean valid-pixel mask (H×W) — GT-valid; pred-range handled here
+    min_depth, max_depth : valid depth range (metres); max_depth=None → no cap
 
     Returns
     -------
-    dict with keys: AbsRel, SqRel, RMSE, RMSElog, delta1, delta2, delta3
+    dict with keys: AbsRel, SqRel, RMSE, RMSElog, delta1, delta2, delta3,
+                    scale_ratio, n_valid
     """
-    p = pred[mask].astype(np.float64)
-    g = gt[mask].astype(np.float64)
+    combined = valid_eval_mask(pred, gt, mask, min_depth, max_depth)
+    n_valid  = int(combined.sum())
+    if n_valid == 0:
+        nan_out = {k: float("nan") for k in
+                   ("AbsRel", "SqRel", "RMSE", "RMSElog",
+                    "delta1", "delta2", "delta3", "scale_ratio")}
+        nan_out["n_valid"] = 0
+        return nan_out
 
-    # Clamp predictions to avoid log(0)
+    p = pred[combined].astype(np.float64)
+    g = gt[combined].astype(np.float64)
+
+    # median(gt/pred) BEFORE any clamp — 1.0 means the prediction is already at
+    # the correct metric scale (useful sanity check for metric models).
+    scale_ratio = float(np.median(g / (p + 1e-8)))
+
+    # Clamp to avoid log(0)
     p = np.clip(p, 1e-6, None)
     g = np.clip(g, 1e-6, None)
 
@@ -206,13 +303,15 @@ def compute_metrics(pred: np.ndarray, gt: np.ndarray,
     delta3  = np.mean(ratio < 1.25 ** 3)
 
     return {
-        "AbsRel":  float(abs_rel),
-        "SqRel":   float(sq_rel),
-        "RMSE":    float(rmse),
-        "RMSElog": float(rmselog),
-        "delta1":  float(delta1),
-        "delta2":  float(delta2),
-        "delta3":  float(delta3),
+        "AbsRel":      float(abs_rel),
+        "SqRel":       float(sq_rel),
+        "RMSE":        float(rmse),
+        "RMSElog":     float(rmselog),
+        "delta1":      float(delta1),
+        "delta2":      float(delta2),
+        "delta3":      float(delta3),
+        "scale_ratio": scale_ratio,
+        "n_valid":     n_valid,
     }
 
 
@@ -230,6 +329,10 @@ def print_metrics(metrics: dict, model: str, variant: str = "",
     print(f"  δ₁     : {metrics['delta1']*100:.2f}%")
     print(f"  δ₂     : {metrics['delta2']*100:.2f}%")
     print(f"  δ₃     : {metrics['delta3']*100:.2f}%")
+    if "scale_ratio" in metrics:
+        print(f"  scale  : {metrics['scale_ratio']:.4f}  (median gt/pred; 1.0 = metric)")
+    if "n_valid" in metrics:
+        print(f"  valid  : {int(metrics['n_valid'])} px  (coverage; compare across models)")
     print(f"{'='*60}\n")
 
 
@@ -578,10 +681,11 @@ def depth_to_normals(depth: np.ndarray,
     Convention
     ----------
     Camera frame: +X right, +Y down, +Z into scene.
-    cross(dPu, dPv) yields Z > 0 for camera-facing surfaces (nz ≈ +1 for a
-    flat wall facing the camera), matching the D2NT / GeoNet++ evaluation
-    convention.  No sign flip is applied; (n+1)/2 RGB encoding gives blue
-    for camera-facing surfaces.
+    Normals are oriented TOWARD the camera: nz < 0 for a surface facing the
+    camera (nz ≈ -1 for a flat frontal wall).  This matches the render
+    pipeline's saved GT normals, which apply the identical toward-camera flip,
+    so depth-derived normals and saved GT normals share one sign convention.
+    (n+1)/2 RGB encoding therefore renders a frontal wall with B ≈ 0.
 
     Parameters
     ----------
@@ -618,11 +722,18 @@ def depth_to_normals(depth: np.ndarray,
     dPu[:, 1:-1] = P[:, 2:] - P[:, :-2]   # right − left
     dPv[1:-1, :] = P[2:, :] - P[:-2, :]   # below − above
 
-    # Cross product: n = dPu × dPv
-    # (+X right) × (+Y down) → nz > 0 (pointing forward / into the scene).
-    # This is the standard convention used by D2NT and matches (n+1)/2 RGB encoding
-    # where a flat wall facing the camera appears blue (nx≈0, ny≈0, nz≈+1 → B≈1).
-    normals = np.cross(dPu, dPv)   # (H, W, 3), nz > 0 for camera-facing surfaces
+    # Cross product: n = dPu × dPv.  (+X right) × (+Y down) initially yields
+    # nz > 0, but the raw cross-product sign is arbitrary (it depends on the
+    # du/dv differencing order).  Orient every normal TOWARD the camera (nz < 0)
+    # so the convention is unambiguous AND matches the render pipeline's saved GT
+    # normals (render_from_poses_blender.py's _normals_from_depth_* apply the
+    # same flip).  Keeping both in the same frame means depth-derived normals can
+    # be compared against the accurate saved fisheye GT normals without a silent
+    # 180° sign error.  With (n+1)/2 RGB encoding, a wall facing the camera is
+    # nz ≈ -1 → B ≈ 0 (same as the saved GT normal maps).
+    normals = np.cross(dPu, dPv)          # (H, W, 3)
+    flip = normals[..., 2] > 0            # NaN → False, so invalid rows untouched
+    normals[flip] *= -1                   # toward-camera convention: nz ≤ 0
 
     # Normalise
     norms = np.linalg.norm(normals, axis=-1, keepdims=True)
@@ -725,16 +836,18 @@ def append_to_csv(csv_path: str, model: str, variant: str,
         if write_header:
             writer.writeheader()
         writer.writerow({
-            "model":     model,
-            "variant":   variant,
-            "AbsRel":    f"{metrics['AbsRel']:.6f}",
-            "SqRel":     f"{metrics['SqRel']:.6f}",
-            "RMSE":      f"{metrics['RMSE']:.6f}",
-            "RMSElog":   f"{metrics['RMSElog']:.6f}",
-            "delta1":    f"{metrics['delta1']:.6f}",
-            "delta2":    f"{metrics['delta2']:.6f}",
-            "delta3":    f"{metrics['delta3']:.6f}",
-            "alignment": alignment,
+            "model":       model,
+            "variant":     variant,
+            "AbsRel":      f"{metrics['AbsRel']:.6f}",
+            "SqRel":       f"{metrics['SqRel']:.6f}",
+            "RMSE":        f"{metrics['RMSE']:.6f}",
+            "RMSElog":     f"{metrics['RMSElog']:.6f}",
+            "delta1":      f"{metrics['delta1']:.6f}",
+            "delta2":      f"{metrics['delta2']:.6f}",
+            "delta3":      f"{metrics['delta3']:.6f}",
+            "scale_ratio": f"{metrics.get('scale_ratio', float('nan')):.6f}",
+            "n_valid":     int(metrics.get('n_valid', 0)),
+            "alignment":   alignment,
         })
     print(f"  [csv] Results appended → {csv_path}")
 
@@ -762,3 +875,31 @@ def append_3dgm_to_csv(csv_path: str, model: str, variant: str,
             "normal_source": normal_source,
         })
     print(f"  [csv] 3DGM results appended → {path_3dgm}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Self-test: normal-sign convention (guards against silent 180° regressions)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _selftest_normal_convention() -> None:
+    """Assert depth_to_normals orients normals toward the camera (nz < 0).
+
+    A flat plane parallel to the image (constant depth) faces the camera, so its
+    normal must point back at the camera: nz ≈ -1 in the +Z-into-scene frame.
+    This must stay consistent with the render pipeline's saved GT normals.
+    Run with:  python eval_utils.py
+    """
+    H = W = 32
+    depth = np.full((H, W), 3.0, dtype=np.float32)     # frontal wall at 3 m
+    n = depth_to_normals(depth, fx=200.0, fy=200.0, cx=W / 2.0, cy=H / 2.0)
+    core = n[4:-4, 4:-4]                                # ignore NaN borders
+    nz = core[..., 2][np.isfinite(core[..., 2])]
+    assert nz.size > 0, "no valid normals produced"
+    assert np.all(nz < 0), f"expected nz<0 (toward camera), got max nz={nz.max():.3f}"
+    assert np.allclose(np.abs(nz), 1.0, atol=1e-3), \
+        "frontal wall normal should be ≈ (0,0,-1)"
+    print("[eval_utils] normal-convention self-test passed: frontal wall → nz ≈ -1")
+
+
+if __name__ == "__main__":
+    _selftest_normal_convention()

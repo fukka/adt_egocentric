@@ -167,14 +167,14 @@ def main():
 
     # ── Evaluate: no alignment (metric) ─────────────────────────────────────
     alignment_direct = "none (metric)"
-    metrics_direct = compute_metrics(pred_metric, gt, mask)
+    metrics_direct = compute_metrics(pred_metric, gt, mask, max_depth=args.max_depth)
     print_metrics(metrics_direct, "UniDepth", variant=args.variant,
                   alignment=alignment_direct)
 
     # ── Evaluate: scale-only alignment (secondary) ──────────────────────────
     pred_scale_aligned = align_scale_only(pred_metric, gt, mask)
     alignment_scale = "scale-only (median ratio)"
-    metrics_scale = compute_metrics(pred_scale_aligned, gt, mask)
+    metrics_scale = compute_metrics(pred_scale_aligned, gt, mask, max_depth=args.max_depth)
     print_metrics(metrics_scale, "UniDepth", variant=f"{args.variant} [scale-aligned]",
                   alignment=alignment_scale)
 

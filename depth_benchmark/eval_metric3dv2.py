@@ -218,14 +218,14 @@ def main():
 
     # ── Evaluate: no alignment ───────────────────────────────────────────────
     alignment_direct = "none (metric)"
-    metrics_direct = compute_metrics(pred_metric, gt, mask)
+    metrics_direct = compute_metrics(pred_metric, gt, mask, max_depth=args.max_depth)
     print_metrics(metrics_direct, "Metric3D v2", variant=args.variant,
                   alignment=alignment_direct)
 
     # ── Evaluate: scale+shift alignment (secondary) ──────────────────────────
     pred_aligned = align_scale_shift(pred_metric, gt, mask)
     alignment_aff = "scale+shift (least-squares)"
-    metrics_aff = compute_metrics(pred_aligned, gt, mask)
+    metrics_aff = compute_metrics(pred_aligned, gt, mask, max_depth=args.max_depth)
     print_metrics(metrics_aff, "Metric3D v2", variant=f"{args.variant} [aff-aligned]",
                   alignment=alignment_aff)
 

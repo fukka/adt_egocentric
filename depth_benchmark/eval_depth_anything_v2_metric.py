@@ -313,7 +313,7 @@ def main():
     # ── Evaluate: direct metric (primary) ────────────────────────────────────
     # No alignment — tests whether the model predicts correct absolute depth.
     alignment_direct = "none (metric)"
-    metrics_direct   = compute_metrics(pred_metric, gt, mask)
+    metrics_direct   = compute_metrics(pred_metric, gt, mask, max_depth=args.max_depth)
     print_metrics(metrics_direct, "Depth Anything V2 Metric",
                   variant=f"{args.variant}/{args.domain}", alignment=alignment_direct)
 
@@ -322,7 +322,7 @@ def main():
     # The gap between this and the direct result quantifies scale error.
     alignment_aff  = "scale+shift (least-squares)"
     pred_aligned   = align_scale_shift(pred_metric, gt, mask)
-    metrics_aff    = compute_metrics(pred_aligned, gt, mask)
+    metrics_aff    = compute_metrics(pred_aligned, gt, mask, max_depth=args.max_depth)
     print_metrics(metrics_aff, "Depth Anything V2 Metric",
                   variant=f"{args.variant}/{args.domain} [aff-aligned]",
                   alignment=alignment_aff)
